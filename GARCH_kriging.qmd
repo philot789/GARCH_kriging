@@ -1,0 +1,4724 @@
+---
+title: "Source Code for: A Heterogeneous Spatiotemporal GARCH Model: A Predictive Framework for Volatility"
+author:
+  - "Philipp Otto"
+  - "Atika Aouri"
+
+format:
+  html:
+    embed-resources: true
+    theme: cosmo
+    toc: true
+    toc-title: "Contents"
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    code-summary: "Show/hide code"
+    code-tools: true
+    code-copy: true
+    code-overflow: wrap
+    df-print: paged
+
+execute:
+  echo: true
+  warning: false
+  message: false
+  
+editor: source
+---
+
+
+
+# Introduction: Heterogeneous spatiotemporal GARCH model
+
+This document provides the code required to reproduce the estimation, spatial prediction, and validation results for the heterogeneous spatiotemporal GARCH model. The model is designed for spatially indexed time series whose conditional variability changes both over time and across locations. Spatial heterogeneity is introduced through location-dependent GARCH coefficient functions, while contemporaneous spatial dependence is captured through the innovation field.
+
+Let $Z_t(s)$ denote the process observed at time $t$ and location $s\in\mathcal D$. The STGARCH$(p,q)$ model is defined by
+$$
+Z_t(s)=\sigma_t(s)\eta_t(s),
+$$
+with conditional variance
+$$
+\sigma_t^2(s)
+=
+\omega(s)
++
+\sum_{j=1}^{q}
+\alpha_j(s)Z_{t-j}^2(s)
++
+\sum_{i=1}^{p}
+\beta_i(s)\sigma_{t-i}^2(s).
+$$
+The innovation field satisfies
+$$
+\mathbb E\{\eta_t(s)\}=0,
+\qquad
+\mathbb E\{\eta_t^2(s)\}=1,
+$$
+and is assumed to be independent over time but potentially dependent across space. The functions $\omega(s)$, $\alpha_j(s)$, and $\beta_i(s)$ allow the volatility dynamics to vary smoothly over the spatial domain.
+
+The empirical implementation uses the STGARCH$(1,1)$ specification
+$$
+\sigma_t^2(s)
+=
+\omega(s)
++
+\alpha(s)Z_{t-1}^2(s)
++
+\beta(s)\sigma_{t-1}^2(s),
+$$
+subject to
+$$
+\omega(s)>0,
+\qquad
+\alpha(s)\geq0,
+\qquad
+\beta(s)\geq0,
+\qquad
+\alpha(s)+\beta(s)<1.
+$$
+The final condition ensures stability of the local conditional-variance recursion.
+
+The spatially varying parameter vector
+$$
+\Theta(s)
+=
+\bigl\{
+\omega(s),\alpha(s),\beta(s)
+\bigr\}^{\top}
+$$
+is estimated locally. At a target location $s_0$, observations from surrounding locations receive kernel weights
+$$
+w_i(s_0)
+=
+K_b(s_i-s_0),
+$$
+where $K_b(\cdot)$ is a spatial kernel with bandwidth $b$. The local weighted quasi-maximum likelihood estimator is
+$$
+\widehat{\Theta}(s_0)
+=
+\operatorname*{arg\,min}_{\Theta}
+\sum_{t=1}^{T}
+\sum_{i=1}^{m}
+w_i(s_0)
+\left[
+\log\{\sigma_t^2(s_i;\Theta)\}
++
+\frac{Z_t^2(s_i)}
+{\sigma_t^2(s_i;\Theta)}
+\right].
+$$
+This local estimation strategy permits gradual spatial variation in the volatility dynamics without requiring a separate unrestricted time-series model at every location.
+
+After estimating the local GARCH parameters, the standardized innovations are recovered as
+$$
+\widehat{\eta}_t(s_i)
+=
+\frac{Z_t(s_i)}
+{\widehat{\sigma}_t(s_i)}.
+$$
+Their spatial covariance structure is then estimated and used to predict volatility at locations not employed in model fitting. Two spatial prediction strategies are considered. The first constructs a best linear predictor of the centered squared innovation
+$$
+\xi_t(s)=\eta_t^2(s)-1.
+$$
+The second assumes that $\eta_t(\cdot)$ is a Gaussian spatial process and uses the conditional-moment identity
+$$
+\mathbb E\!\left[
+\eta_t^2(s_0)
+\mid
+\boldsymbol{\eta}_t
+\right]
+=
+\mu_{\eta,t}^2(s_0)
++
+v_\eta(s_0),
+$$
+where $\mu_{\eta,t}(s_0)$ and $v_\eta(s_0)$ are the conditional mean and variance obtained from Gaussian spatial prediction.
+
+For either method, the predicted squared process is constructed recursively as
+$$
+\widehat{\sigma}_t^2(s_0)
+=
+\widehat{\omega}(s_0)
++
+\widehat{\alpha}(s_0)
+\widehat Z_{t-1}^2(s_0)
++
+\widehat{\beta}(s_0)
+\widehat{\sigma}_{t-1}^2(s_0),
+$$
+followed by
+$$
+\widehat Z_t^2(s_0)
+=
+\widehat{\sigma}_t^2(s_0)
+\widehat{\eta_t^2}(s_0).
+$$
+
+The following sections implement this workflow, compare the two spatial predictors using identical cross-validation folds, and evaluate their predictive accuracy. Independent local estimation and prediction tasks are evaluated in parallel across spatial locations, while the time recursion within each location remains sequential.
+
+
+# Functions needed for the code
+
+```{r}
+#| label: functions
+#| message: false
+#| eval: true
+#| warning: false
+#| code-fold: true
+#| code-summary: "Functions used in the simulations and case studies"
+
+# STGARCH(1,1): local QMLE and the two feasible predictors in Appendix C.
+# Only complete, finite input data are supported. Preprocessing is external.
+# Coordinates must be on the same two-dimensional scale used in the paper.
+# The xi covariance below uses the working relation C_xi = 2 C_eta^2;
+# that relation is an additional fourth-moment restriction, not distribution-free.
+
+stgarch_bandwidth <- function(dx, dy) {
+  sqrt(mean(c(stats::var(dx), stats::var(dy)))) * length(dx)^(-1 / 6)
+}
+
+# backward compatibility
+default_bandwidth <- function(dx, dy) {
+  coords <- cbind(dx, dy)
+  sigma <- sqrt(mean(apply(coords, 2, var)))
+  
+  sigma * length(dx)^(-1 / 6)
+}
+
+# backward compatibility
+a2d_sepgauss <- function(dx, dy, b) {
+  log_weights <- -0.5 * (
+    (dx / b)^2 +
+      (dy / b)^2
+  )
+  
+  weights <- exp(log_weights - max(log_weights))
+  
+  weights / sum(weights)
+}
+
+# backward compatibility
+# Define uniform (box) kernels
+a2d_box <- function(dx, dy, b) {
+  # rectangular window: |dx| ≤ b and |dy| ≤ b
+  w <- (abs(dx) <= b) & (abs(dy) <= b)
+  w / sum(w)
+}
+# backward compatibility
+# (optional circular window)
+a2d_circle <- function(dx, dy, b) {
+  d2 <- dx^2 + dy^2
+  w <- (d2 <= b^2)
+  w / sum(w)
+}
+# backward compatibility
+# gaussian 
+a2d_gaussian <- function(dx, dy, b) {
+  
+  d2 <- dx^2 + dy^2
+  w  <- exp( - d2 / (2 * b^2) )
+  w / sum(w)
+}
+
+
+# GARCH simulation given eta and params
+simulation <- function(eta, omega, alpha, beta) {
+  T <- nrow(eta);
+  n <- ncol(eta)
+  
+  Z <- sigma2 <- matrix(0, nrow = T, ncol = n)
+  
+  # sigma2[1, ] <- omega
+  sigma2[1, ] <- omega / (1 - alpha - beta)
+  
+  for (t in 2:T) {
+    for (u in 1:n) {
+      sigma2[t,u] <- omega[u] + alpha[u]*Z[t-1,u]^2 + beta[u]*sigma2[t-1,u]
+      Z[t,u] <- sqrt(sigma2[t,u]) * eta[t,u]
+    }
+  }
+  return(list(Z = Z, sigma2 = sigma2))
+}
+
+
+
+
+stgarch_weights <- function(dx, dy, b) {
+  # A separable biweight kernel: symmetric, Lipschitz, and compactly supported,
+  # as required by the theoretical kernel assumptions. Normalizing the weights
+  # does not change the local QMLE minimizer.
+  w <- pmax(1 - (dx / b)^2, 0)^2 * pmax(1 - (dy / b)^2, 0)^2
+  if (sum(w) > 0) w / sum(w) else w
+}
+
+.stgarch_data <- function(Z, coords) {
+  Z <- as.matrix(Z)
+  coords <- as.matrix(coords)
+  if (!is.numeric(Z) || !is.numeric(coords) || nrow(Z) < 3L ||
+      ncol(Z) < 2L || nrow(coords) != ncol(Z) || ncol(coords) != 2L ||
+      any(!is.finite(Z)) || any(!is.finite(coords)) ||
+      any(!is.finite(Z^2))) {
+    stop("Supply finite numeric Z (time x sites) and coords (sites x 2), ",
+         "with at least three times and two sites.")
+  }
+  if (anyDuplicated(as.data.frame(coords)))
+    stop("coords must identify distinct sites; duplicate coordinates need an explicit nugget interpretation.")
+  list(Z = Z, coords = coords)
+}
+
+.stgarch_controls <- function(theta_init, lower, upper, stationarity_margin) {
+  if (!is.numeric(theta_init) || !is.numeric(lower) || !is.numeric(upper) ||
+      length(theta_init) != 3L || length(lower) != 3L || length(upper) != 3L ||
+      any(!is.finite(c(theta_init, lower, upper))) ||
+      lower[1] <= 0 || any(lower[2:3] < 0) || any(upper <= lower) ||
+      length(stationarity_margin) != 1L || !is.finite(stationarity_margin) ||
+      stationarity_margin <= 0 || stationarity_margin >= 1 ||
+      any(theta_init <= lower) || any(theta_init >= upper) ||
+      sum(theta_init[2:3]) >= 1 - stationarity_margin) {
+    stop("Use finite bounds, lower[1] > 0, nonnegative alpha/beta bounds, ",
+         "and an interior theta_init with alpha + beta < 1 - stationarity_margin.")
+  }
+}
+
+.stgarch_parallel <- function(parallel, n_workers) {
+  if (!is.logical(parallel) || length(parallel) != 1L || is.na(parallel))
+    stop("parallel must be TRUE or FALSE.")
+  if (!parallel) return(function() invisible(NULL))
+  if (!requireNamespace("future", quietly = TRUE) ||
+      !requireNamespace("future.apply", quietly = TRUE))
+    stop("Install the future and future.apply packages for parallel fitting.")
+  if (length(n_workers) != 1L || !is.finite(n_workers) ||
+      n_workers < 2L || n_workers != as.integer(n_workers))
+    stop("Use at least two integer workers when parallel = TRUE.")
+  old_plan <- future::plan("list")
+  # Separate R sessions work on Windows, macOS, and Linux, including RStudio.
+  future::plan(future::multisession, workers = as.integer(n_workers))
+  function() future::plan(old_plan)
+}
+
+.stgarch_map <- function(X, FUN, parallel) {
+  if (parallel) {
+    future.apply::future_lapply(X, FUN, future.seed = TRUE)
+  } else {
+    lapply(X, FUN)
+  }
+}
+
+.stgarch_bandwidth <- function(coords, bandwidth, bandwidth_function) {
+  if (is.null(bandwidth)) bandwidth <- bandwidth_function(coords[, 1], coords[, 2])
+  if (length(bandwidth) != 1L || !is.finite(bandwidth) || bandwidth <= 0)
+    stop("The bandwidth must be a finite positive scalar.")
+  bandwidth
+}
+
+.stgarch_qml <- function(theta, Z2, w) {
+  # The same unconditional initialization is used for fitting and inversion.
+  # Row 1 initializes the recursion; rows 2:T enter the likelihood.
+  omega <- theta[1]; alpha <- theta[2]; beta <- theta[3]
+  gap <- 1 - alpha - beta
+  if (omega <= 0 || alpha < 0 || beta < 0 || gap <= 0)
+    return(list(value = Inf, gradient = rep(NA_real_, 3)))
+  h <- rep(omega / gap, ncol(Z2))
+  dh <- matrix(rep(c(1 / gap, omega / gap^2, omega / gap^2),
+                   each = ncol(Z2)), ncol = 3L)
+  value <- 0
+  gradient <- numeric(3)
+  for (tt in 2:nrow(Z2)) {
+    dh <- cbind(1, Z2[tt - 1L, ], h) + beta * dh
+    h <- omega + alpha * Z2[tt - 1L, ] + beta * h
+    value <- value + sum(w * (log(h) + Z2[tt, ] / h)) / 2
+    gradient <- gradient + colSums(dh * (w * (1 - Z2[tt, ] / h) / (2 * h)))
+  }
+  list(value = value / (nrow(Z2) - 1L),
+       gradient = gradient / (nrow(Z2) - 1L))
+}
+
+.stgarch_local <- function(Z2, coords, target, theta_init, lower, upper,
+                           bandwidth, weight_function, stationarity_margin) {
+  w <- weight_function(coords[, 1] - target[1], coords[, 2] - target[2], bandwidth)
+  if (length(w) != ncol(Z2) || any(!is.finite(w)) || any(w < 0) || sum(w) <= 0)
+    stop("Invalid spatial weights or no sites inside the kernel support.")
+  w <- w / sum(w)
+  # Scaling changes the optimization coordinates, not the model or objective.
+  scale <- c(max(sum(colMeans(Z2) * w), theta_init[1]), 1, 1)
+  ui <- rbind(diag(3), -diag(3), c(0, -1, -1))
+  ci <- c(lower, -upper, -(1 - stationarity_margin))
+  ui <- sweep(ui, 2L, scale, `*`)
+  last_x <- NULL; last_result <- NULL
+  evaluate <- function(x) {
+    if (!identical(x, last_x)) {
+      last_result <<- .stgarch_qml(x * scale, Z2, w)
+      last_x <<- x
+    }
+    last_result
+  }
+  fit <- stats::constrOptim(
+    theta = theta_init / scale,
+    f = function(x) evaluate(x)$value,
+    grad = function(x) evaluate(x)$gradient * scale,
+    ui = ui, ci = ci, method = "BFGS",
+    control = list(maxit = 1000L, reltol = 1e-9),
+    outer.iterations = 100L, outer.eps = 1e-7
+  )
+  theta <- fit$par * scale
+  if (fit$convergence != 0L || !is.finite(fit$value) ||
+      any(!is.finite(theta)) || any(theta < lower) || any(theta > upper) ||
+      sum(theta[2:3]) > 1 - stationarity_margin)
+    stop("Local QMLE failed at (", paste(signif(target, 6), collapse = ", "),
+         "). Optimizer code: ", fit$convergence, ". No prediction was substituted.")
+  stats::setNames(theta, c("omega", "alpha", "beta"))
+}
+
+stgarch_invert <- function(Z, parameters) {
+  # parameters must correspond, in order, to the observed columns of Z.
+  Z <- as.matrix(Z); 
+  parameters <- as.matrix(parameters)
+  if (!is.numeric(Z) || !is.numeric(parameters) || nrow(Z) < 2L ||
+      nrow(parameters) != ncol(Z) || ncol(parameters) != 3L ||
+      any(!is.finite(Z^2)) || any(!is.finite(parameters)) ||
+      any(parameters[, 1] <= 0) || any(parameters[, 2:3] < 0) ||
+      any(rowSums(parameters[, 2:3, drop = FALSE]) >= 1))
+    stop("Invalid data or parameters for inversion.")
+  h <- matrix(NA_real_, nrow(Z), ncol(Z), dimnames = dimnames(Z))
+  h[1, ] <- parameters[, 1] / (1 - parameters[, 2] - parameters[, 3])
+  eta <- matrix(NA_real_, nrow(Z), ncol(Z))
+  for (tt in 2:nrow(Z)) {
+    h[tt, ] <- parameters[, 1] + parameters[, 2] * Z[tt - 1L, ]^2 +
+      parameters[, 3] * h[tt - 1L, ]
+    eta[tt, ] <- Z[tt, ] / sqrt(h[tt, ])
+  }
+  if (any(!is.finite(h)) || any(!is.finite(eta[-1L, , drop = FALSE])))
+    stop("Nonfinite variance or standardized residuals.")
+  list(sigma2 = h, eta = eta, xi = eta^2 - 1)
+}
+
+.stgarch_covariance <- function(eta, D) {
+  # Fit the exponential-plus-nugget model in (27) by Gaussian quasi-likelihood.
+  # The free total variance is a nuisance scale; the fitted covariance is then
+  # normalized to C_eta(0) = 1. Residual values are NOT rescaled or re-centered.
+  positive_D <- D[D > 0]
+  if (!length(positive_D)) stop("Spatial covariance requires distinct coordinates.")
+  scale_D <- stats::median(positive_D)
+  D_scaled <- D / scale_D
+  S <- crossprod(eta) / nrow(eta)
+  marginal <- mean(diag(S))
+  if (!is.finite(marginal) || marginal <= 0) stop("Degenerate standardized residuals.")
+  objective <- function(par) {
+    R <- par[2] * exp(-D_scaled / par[1]) + diag(par[3], nrow(D))
+    U <- tryCatch(chol(R), error = function(e) NULL)
+    if (is.null(U)) return(.Machine$double.xmax / 100)
+    inv_R <- chol2inv(U)
+    sum(log(diag(U))) + sum(inv_R * S) / 2
+  }
+  fit <- stats::optim(
+    par = c(1, 0.8 * marginal, 0.2 * marginal), fn = objective,
+    method = "L-BFGS-B", lower = c(min(positive_D) / scale_D / 100, 1e-10, 1e-10),
+    upper = c(2 * max(D_scaled), Inf, Inf),
+    control = list(maxit = 1000L, factr = 1e7)
+  )
+  if (fit$convergence != 0L || !is.finite(fit$value) || any(!is.finite(fit$par)))
+    stop("Spatial covariance fit failed; optimizer code: ", fit$convergence)
+  range <- fit$par[1] * scale_D
+  fraction <- fit$par[2] / sum(fit$par[2:3])
+  R_eta <- fraction * exp(-D / range) + diag(1 - fraction, nrow(D))
+  if (fit$par[1] <= min(positive_D) / scale_D / 100 * (1 + 1e-6) ||
+      fit$par[1] >= 2 * max(D_scaled) * (1 - 1e-6))
+    warning("Spatial range is at a search boundary; inspect covariance adequacy.")
+  list(range = range, spatial_variance = fraction, nugget_variance = 1 - fraction,
+       raw_total_variance = sum(fit$par[2:3]), R_eta = R_eta)
+}
+
+.stgarch_predict <- function(theta, eta, r_eta, R_chol, predictor, epsilon) {
+  r <- if (predictor == "xi_blp") 2 * r_eta^2 else r_eta
+  gamma <- as.numeric(backsolve(R_chol, forwardsolve(t(R_chol), r)))
+  marginal <- if (predictor == "xi_blp") 2 else 1
+  v <- marginal - sum(r * gamma)
+  if (!is.finite(v) || v < -1e-8 * marginal)
+    stop("Invalid kriging variance; check the covariance matrix and target covariance.")
+  v <- max(v, 0) # Only remove negative roundoff; not a positivity adjustment.
+  projection <- as.numeric(
+    (if (predictor == "xi_blp") eta[-1L, , drop = FALSE]^2 - 1 else
+      eta[-1L, , drop = FALSE]) %*% gamma
+  )
+  h <- z2 <- numeric(nrow(eta))
+  spatial_mspe <- rep(NA_real_, nrow(eta))
+  h[1] <- z2[1] <- theta[1] / (1 - theta[2] - theta[3])
+  for (tt in 2:nrow(eta)) {
+    h[tt] <- theta[1] + theta[2] * z2[tt - 1L] + theta[3] * h[tt - 1L]
+    multiplier <- if (predictor == "xi_blp") 1 + projection[tt - 1L] else
+      projection[tt - 1L]^2 + v
+    raw <- h[tt] * multiplier
+    if (!is.finite(h[tt]) || h[tt] <= 0 || !is.finite(raw))
+      stop("Nonfinite prediction; no floor or fallback can repair this fit.")
+    # Equation (35) truncates the PRODUCT, not the standardized multiplier.
+    z2[tt] <- if (predictor == "xi_blp") max(raw, epsilon) else raw
+    # (36) is for the unadjusted spatial error component, not total uncertainty.
+    # Gaussian expression follows Var(eta_0^2 | eta) = 2 v^2 + 4 mu^2 v.
+    spatial_mspe[tt] <- h[tt]^2 * if (predictor == "xi_blp") v else
+      (2 * v^2 + 4 * projection[tt - 1L]^2 * v)
+  }
+  if (any(z2 < 0) || any(!is.finite(spatial_mspe[-1L])))
+    stop("Invalid prediction or spatial error variance.")
+  list(z2 = z2, h = h, spatial_mspe = spatial_mspe)
+}
+
+fit_stgarch_spatial_cv <- function(
+    Z, coords, theta_init, lower, upper,
+    predictor = c("xi_blp", "eta_gaussian"),
+    folds = NULL, n_folds = 5L, seed = 5515L,
+    weight_function = stgarch_weights, bandwidth_function = stgarch_bandwidth,
+    bandwidth = NULL, stationarity_margin = 1e-4, epsilon = 1e-8,
+    parallel = FALSE, n_workers = 2L, progress = interactive()) {
+  predictor <- match.arg(predictor)
+  input <- .stgarch_data(Z, coords); Z <- input$Z; coords <- input$coords
+  .stgarch_controls(theta_init, lower, upper, stationarity_margin)
+  if (length(epsilon) != 1L || !is.finite(epsilon) || epsilon <= 0)
+    stop("epsilon must be finite and positive.")
+  n <- ncol(Z)
+  if (is.null(folds)) {
+    if (length(n_folds) != 1L || !is.finite(n_folds) || n_folds < 2L ||
+        n_folds > n || n_folds != as.integer(n_folds)) stop("Invalid n_folds.")
+    # Preserve the caller's random-number state when generating folds.
+    had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    if (had_seed) old_seed <- get(".Random.seed", envir = .GlobalEnv)
+    set.seed(seed)
+    folds <- sample(rep(seq_len(n_folds), length.out = n))
+    if (had_seed) assign(".Random.seed", old_seed, envir = .GlobalEnv) else
+      rm(".Random.seed", envir = .GlobalEnv)
+  }
+  if (length(folds) != n || anyNA(folds) || length(unique(folds)) < 2L)
+    stop("folds must assign every site to one of at least two folds.")
+  bandwidth <- .stgarch_bandwidth(coords, bandwidth, bandwidth_function)
+  restore <- .stgarch_parallel(parallel, n_workers); on.exit(restore(), add = TRUE)
+  Z_pred_S2 <- sigma2_pred_S2 <- spatial_mspe <- matrix(NA_real_, nrow(Z), n,
+                                                        dimnames = dimnames(Z))
+  parameters <- matrix(NA_real_, n, 3L,
+                       dimnames = list(colnames(Z), c("omega", "alpha", "beta")))
+  covariance_fits <- list()
+  for (fold in unique(folds)) {
+    if (progress) message("Fitting fold ", fold)
+    test <- which(folds == fold); train <- which(folds != fold)
+    if (length(train) < 2L) stop("Every fold needs at least two training sites.")
+    Z_train <- Z[, train, drop = FALSE]
+    coords_train <- coords[train, , drop = FALSE]
+    local_fit <- function(target) .stgarch_local(
+      Z_train^2, coords_train, target, theta_init, lower, upper,
+      bandwidth, weight_function, stationarity_margin
+    )
+    training_parameters <- do.call(rbind, .stgarch_map(
+      seq_along(train), function(j) local_fit(coords_train[j, ]), parallel
+    ))
+    eta <- stgarch_invert(Z_train, training_parameters)$eta
+    D <- as.matrix(stats::dist(coords_train))
+    cov_fit <- .stgarch_covariance(eta[-1L, , drop = FALSE], D)
+    R <- if (predictor == "xi_blp") 2 * cov_fit$R_eta^2 else cov_fit$R_eta
+    R_chol <- chol(R)
+    predictions <- .stgarch_map(test, function(i) {
+      theta <- local_fit(coords[i, ])
+      distances <- sqrt(rowSums(sweep(coords_train, 2L, coords[i, ], `-`)^2))
+      # No nugget in cross-covariance to a distinct, unobserved site.
+      r_eta <- cov_fit$spatial_variance * exp(-distances / cov_fit$range)
+      list(theta = theta, prediction = .stgarch_predict(
+        theta, eta, r_eta, R_chol, predictor, epsilon
+      ))
+    }, parallel)
+    for (j in seq_along(test)) {
+      i <- test[j]; out <- predictions[[j]]
+      parameters[i, ] <- out$theta
+      Z_pred_S2[, i] <- out$prediction$z2
+      sigma2_pred_S2[, i] <- out$prediction$h
+      spatial_mspe[, i] <- out$prediction$spatial_mspe
+    }
+    cov_fit$R_eta <- NULL
+    covariance_fits[[as.character(fold)]] <- cov_fit
+  }
+  # The empirical section defines the volatility score using sqrt(h), not
+  # sqrt(predicted Z^2). These are different prediction targets. Absolute Z is
+  # a noisy proxy, so this is not direct error against the latent true sigma.
+  error <- sqrt(sigma2_pred_S2[-1L, , drop = FALSE]) - abs(Z[-1L, , drop = FALSE])
+  if (any(!is.finite(error))) stop("Incomplete CV evaluation; refusing a partial score.")
+  if (!is.finite(mean(error^2))) stop("Overflow in the CV score.")
+  list(Z_pred_S2 = Z_pred_S2, sigma2_pred_S2 = sigma2_pred_S2,
+       estimated_params = parameters, estimated_params_all = parameters,
+       spatial_mspe = spatial_mspe, folds = folds, predictor = predictor,
+       RMSE_vol = sqrt(mean(error^2)), MAE_vol = mean(abs(error)),
+       evaluation_coverage = 1, bandwidth = bandwidth, covariance_fits = covariance_fits)
+}
+
+fit_stgarch_local_parameters <- function(
+    Z, coords, theta_init, lower, upper, target_coords = coords,
+    weight_function = stgarch_weights, bandwidth_function = stgarch_bandwidth,
+    bandwidth = NULL, stationarity_margin = 1e-4,
+    parallel = FALSE, n_workers = 2L, progress = interactive()) {
+  input <- .stgarch_data(Z, coords); Z <- input$Z; coords <- input$coords
+  .stgarch_controls(theta_init, lower, upper, stationarity_margin)
+  target_coords <- as.matrix(target_coords)
+  if (!is.numeric(target_coords) || ncol(target_coords) != 2L ||
+      nrow(target_coords) < 1L || any(!is.finite(target_coords)))
+    stop("target_coords must be a finite numeric matrix with two columns.")
+  bandwidth <- .stgarch_bandwidth(coords, bandwidth, bandwidth_function)
+  restore <- .stgarch_parallel(parallel, n_workers); on.exit(restore(), add = TRUE)
+  if (progress) message("Fitting ", nrow(target_coords), " local parameter vectors")
+  parameters <- do.call(rbind, .stgarch_map(seq_len(nrow(target_coords)), function(i) {
+    .stgarch_local(Z^2, coords, target_coords[i, ], theta_init, lower, upper,
+                   bandwidth, weight_function, stationarity_margin)
+  }, parallel))
+  list(estimated_params = parameters, estimated_params_all = parameters,
+       target_coords = target_coords, bandwidth = bandwidth)
+}
+
+
+```
+
+# Reduced Monte Carlo simulation
+
+The following experiment illustrates the complete simulation, estimation and
+prediction workflow. To keep the rendering time manageable, it uses ten Monte
+Carlo replications. These settings are intended as a
+computational demonstration rather than as a replacement for the full
+simulation study reported in the paper.
+
+
+```{r}
+#| label: run-reduced-simulation
+#| code-fold: false
+#| code-summary: "Show simulation code"
+#| cache: true
+#| message: false
+#| warning: false
+
+source("stgarch_spatial_estimation_parallelCV.R")
+
+
+if (!exists("simulation", mode = "function")) {
+  stop("First define or source the original simulation() function.")
+}
+
+if (!exists("a2d_box", mode = "function")) {
+  stop("First define or source the original a2d_box() kernel function.")
+}
+
+# ==============================================================================
+# Simulation design and estimation settings
+# ==============================================================================
+
+T <- 300L
+p <- 1L
+n1 <- 150L
+n2 <- 50L
+MC <- 10L
+
+n_knots <- 4L
+degree <- 3L
+sigma2_eta <- 1
+theta_range <- 0.5
+grid_size <- 10L
+
+parallel_sim <- TRUE
+n_workers_sim <- 5L
+
+predictors <- c("xi_blp", "eta_gaussian")
+
+# Method used for the unsuffixed output aliases below.
+predictor <- "xi_blp"
+
+param_names <- c("omega", "alpha", "beta")
+
+# Fixed finite bounds containing the simulated parameter surfaces.
+theta_init <- c(omega = 0.3, alpha = 0.2, beta = 0.3)
+lb <- c(omega = 1e-8, alpha = 0, beta = 0)
+ub <- c(omega = 1, alpha = 1, beta = 1)
+
+stationarity_margin <- 1e-4
+epsilon <- 1e-8
+
+# Retain the original bandwidth and box kernel.
+b <- n1^(-1 / 4)
+simulation_weights <- a2d_box
+
+# Prediction grid.
+x_vals <- seq(0, 1, length.out = grid_size)
+y_vals <- seq(0, 1, length.out = grid_size)
+grid <- expand.grid(x = x_vals, y = y_vals)
+S0 <- as.matrix(grid)
+n0 <- nrow(S0)
+
+internal_knots <- seq(
+  0, 1, length.out = n_knots + 2L
+)[-c(1L, n_knots + 2L)]
+
+# Row-wise tensor-product basis: one row per spatial location.
+spatial_basis <- function(S) {
+
+  Bx <- splines2::bSpline(
+    S[, 1],
+    knots = internal_knots,
+    degree = degree,
+    intercept = TRUE,
+    Boundary.knots = c(0, 1)
+  )
+
+  By <- splines2::bSpline(
+    S[, 2],
+    knots = internal_knots,
+    degree = degree,
+    intercept = TRUE,
+    Boundary.knots = c(0, 1)
+  )
+
+  do.call(
+    cbind,
+    lapply(seq_len(ncol(Bx)), function(j) {
+      By * Bx[, j]
+    })
+  )
+}
+
+# ==============================================================================
+# Storage
+# ==============================================================================
+
+new_prediction_array <- function() {
+  array(NA_real_, dim = c(T, n2, MC))
+}
+
+estimated_params_S0_MC <- true_params_S0_MC <- array(
+  NA_real_,
+  dim = c(n0, 3L, MC),
+  dimnames = list(NULL, param_names, NULL)
+)
+
+Z_true_S2_MC <- sigma2_true_S2_MC <- new_prediction_array()
+
+Z_pred_by_method <- setNames(
+  lapply(predictors, function(x) new_prediction_array()),
+  predictors
+)
+
+sigma2_pred_by_method <- setNames(
+  lapply(predictors, function(x) new_prediction_array()),
+  predictors
+)
+
+pred_vol_S2_MC <- true_vol_S2_MC <- matrix(
+  NA_real_, nrow = n2, ncol = MC
+)
+
+covariance_fits_MC <- vector("list", MC)
+locations_MC <- vector("list", MC)
+
+# ==============================================================================
+# Monte Carlo replications
+# ==============================================================================
+
+for (mc_id in seq_len(MC)) {
+
+  set.seed(mc_id)
+
+  cat(sprintf(
+    "Monte Carlo replication %d / %d\n",
+    mc_id, MC
+  ))
+
+  S1 <- matrix(runif(n1 * 2L), ncol = 2L)
+  S2 <- matrix(runif(n2 * 2L), ncol = 2L)
+
+  locations_MC[[mc_id]] <- list(S1 = S1, S2 = S2)
+
+  # ---------------------------------------------------------------------------
+  # True parameter surfaces
+  # ---------------------------------------------------------------------------
+
+  B_S1 <- spatial_basis(S1)
+  B_S2 <- spatial_basis(S2)
+  B_S0 <- spatial_basis(S0)
+
+  stopifnot(max(abs(rowSums(B_S0) - 1)) < 1e-10)
+
+  nb <- ncol(B_S1)
+
+  beta_omega <- 0.05 + 0.3 * runif(nb)
+  beta_alpha <- 0.05 + 0.3 * runif(nb)
+  beta_beta <- 0.05 + 0.5 * runif(nb)
+
+  coefficients <- cbind(
+    beta_omega,
+    beta_alpha,
+    beta_beta
+  )
+
+  true_params_S1 <- B_S1 %*% coefficients
+  true_params_S2 <- B_S2 %*% coefficients
+  true_params_S0 <- B_S0 %*% coefficients
+
+  colnames(true_params_S1) <-
+    colnames(true_params_S2) <-
+    colnames(true_params_S0) <- param_names
+
+  true_params_S0_MC[, , mc_id] <- true_params_S0
+
+  # ---------------------------------------------------------------------------
+  # Simulate spatially correlated Gaussian innovations and GARCH observations
+  # ---------------------------------------------------------------------------
+
+  D_all <- as.matrix(
+    stats::dist(rbind(S1, S2))
+  )
+
+  cov_eta <- sigma2_eta * exp(-D_all / theta_range)
+  L <- t(chol(cov_eta))
+
+  eta <- t(
+    L %*% matrix(
+      rnorm((n1 + n2) * T),
+      nrow = n1 + n2
+    )
+  )
+
+  sim1 <- simulation(
+    eta[, seq_len(n1), drop = FALSE],
+    true_params_S1[, "omega"],
+    true_params_S1[, "alpha"],
+    true_params_S1[, "beta"]
+  )
+
+  sim2 <- simulation(
+    eta[, n1 + seq_len(n2), drop = FALSE],
+    true_params_S2[, "omega"],
+    true_params_S2[, "alpha"],
+    true_params_S2[, "beta"]
+  )
+
+  Z_S1 <- as.matrix(sim1$Z)
+  Z_S2 <- as.matrix(sim2$Z)
+  sigma2_S1 <- as.matrix(sim1$sigma2)
+  sigma2_S2 <- as.matrix(sim2$sigma2)
+
+  stopifnot(
+    identical(dim(Z_S1), c(T, n1)),
+    identical(dim(Z_S2), c(T, n2)),
+    identical(dim(sigma2_S1), c(T, n1)),
+    identical(dim(sigma2_S2), c(T, n2)),
+    all(is.finite(Z_S1)),
+    all(is.finite(Z_S2)),
+    all(is.finite(sigma2_S1)),
+    all(is.finite(sigma2_S2)),
+    all(sigma2_S1 > 0),
+    all(sigma2_S2 > 0)
+  )
+
+  Z_true_S2_MC[, , mc_id] <- Z_S2
+  sigma2_true_S2_MC[, , mc_id] <- sigma2_S2
+
+  # ---------------------------------------------------------------------------
+  # Local parameter estimation using S1 observations only
+  # ---------------------------------------------------------------------------
+
+  # Fit parameters at training sites, prediction sites, and grid sites together.
+  local_fit <- fit_stgarch_local_parameters(
+    Z = Z_S1,
+    coords = S1,
+    target_coords = rbind(S1, S2, S0),
+    theta_init = theta_init,
+    lower = lb,
+    upper = ub,
+    weight_function = simulation_weights,
+    bandwidth = b,
+    stationarity_margin = stationarity_margin,
+    parallel = parallel_sim,
+    n_workers = n_workers_sim,
+    progress = FALSE
+  )
+
+  estimated_params_S1 <- local_fit$estimated_params[
+    seq_len(n1), , drop = FALSE
+  ]
+
+  estimated_params_S2 <- local_fit$estimated_params[
+    n1 + seq_len(n2), , drop = FALSE
+  ]
+
+  estimated_params_S0 <- local_fit$estimated_params[
+    n1 + n2 + seq_len(n0), , drop = FALSE
+  ]
+
+  estimated_params_S0_MC[, , mc_id] <- estimated_params_S0
+
+  # ---------------------------------------------------------------------------
+  # Recover innovations and fit their spatial covariance
+  # ---------------------------------------------------------------------------
+
+  inv <- stgarch_invert(
+    Z_S1,
+    estimated_params_S1
+  )
+
+  eta_S1_hat <- inv$eta
+  xi_S1_hat <- inv$xi
+  zeta_S1_hat <- inv$sigma2 * inv$xi
+
+  D_train <- as.matrix(stats::dist(S1))
+
+  # Same covariance helper used by fit_stgarch_spatial_cv().
+  par_eta_hat <- .stgarch_covariance(
+    eta_S1_hat[-1L, , drop = FALSE],
+    D_train
+  )
+
+  covariance_fits_MC[[mc_id]] <- par_eta_hat[
+    setdiff(names(par_eta_hat), "R_eta")
+  ]
+
+  # ---------------------------------------------------------------------------
+  # Predict at S2 using both methods, without using S2 observations
+  # ---------------------------------------------------------------------------
+
+  for (method in predictors) {
+
+    R <- if (method == "xi_blp") {
+      2 * par_eta_hat$R_eta^2
+    } else {
+      par_eta_hat$R_eta
+    }
+
+    R_chol <- chol(R)
+
+    for (i in seq_len(n2)) {
+
+      distances <- sqrt(
+        rowSums(
+          sweep(S1, 2L, S2[i, ], `-`)^2
+        )
+      )
+
+      r_eta <- par_eta_hat$spatial_variance *
+        exp(-distances / par_eta_hat$range)
+
+      # Same prediction recursion used by fit_stgarch_spatial_cv().
+      prediction <- .stgarch_predict(
+        theta = estimated_params_S2[i, ],
+        eta = eta_S1_hat,
+        r_eta = r_eta,
+        R_chol = R_chol,
+        predictor = method,
+        epsilon = epsilon
+      )
+
+      Z_pred_by_method[[method]][, i, mc_id] <-
+        prediction$z2
+
+      sigma2_pred_by_method[[method]][, i, mc_id] <-
+        prediction$h
+    }
+  }
+
+  # Unconditional standard deviations, not unconditional variances.
+  pred_vol_S2_MC[, mc_id] <- sqrt(
+    estimated_params_S2[, "omega"] /
+      (
+        1 - rowSums(
+          estimated_params_S2[, c("alpha", "beta"), drop = FALSE]
+        )
+      )
+  )
+
+  true_vol_S2_MC[, mc_id] <- sqrt(
+    true_params_S2[, "omega"] /
+      (
+        1 - rowSums(
+          true_params_S2[, c("alpha", "beta"), drop = FALSE]
+        )
+      )
+  )
+}
+
+# Convenient output names for subsequent chunks.
+Z_pred_S2_MC <- Z_pred_by_method[[predictor]]
+sigma2_pred_S2_MC <- sigma2_pred_by_method[[predictor]]
+
+Z_pred_S2 <- Z_pred_S2_MC[, , MC]
+sigma2_pred_S2 <- sigma2_pred_S2_MC[, , MC]
+
+# ==============================================================================
+# Scores against the known simulation truth
+# ==============================================================================
+
+score_error <- function(error) {
+
+  stopifnot(all(is.finite(error)))
+
+  c(
+    Bias = mean(error),
+    RMSE = sqrt(mean(error^2)),
+    MAE = mean(abs(error))
+  )
+}
+
+# Exclude the initialization row.
+# Unlike the empirical score against absolute observed returns, these scores
+# evaluate predictions against the true latent conditional volatility.
+dynamic_results <- do.call(
+  rbind,
+  lapply(predictors, function(method) {
+
+    do.call(
+      rbind,
+      lapply(seq_len(MC), function(mc_id) {
+
+        error <- sqrt(
+          sigma2_pred_by_method[[method]][-1L, , mc_id]
+        ) - sqrt(
+          sigma2_true_S2_MC[-1L, , mc_id]
+        )
+
+        data.frame(
+          replication = mc_id,
+          predictor = method,
+          as.list(score_error(error)),
+          row.names = NULL
+        )
+      })
+    )
+  })
+)
+
+print(dynamic_results)
+
+# Parameter errors at the fixed S0 grid.
+parameter_error <- estimated_params_S0_MC - true_params_S0_MC
+
+bias_params_S0 <- apply(
+  parameter_error, c(1, 2), mean
+)
+
+rmse_params_S0 <- sqrt(
+  apply(parameter_error^2, c(1, 2), mean)
+)
+
+mae_params_S0 <- apply(
+  abs(parameter_error), c(1, 2), mean
+)
+
+bias_omega_grid <- matrix(
+  bias_params_S0[, "omega"], grid_size, grid_size
+)
+
+rmse_omega_grid <- matrix(
+  rmse_params_S0[, "omega"], grid_size, grid_size
+)
+
+mae_omega_grid <- matrix(
+  mae_params_S0[, "omega"], grid_size, grid_size
+)
+
+# Pool squared errors before taking the square root.
+parameter_summary <- do.call(
+  rbind,
+  lapply(param_names, function(param) {
+    data.frame(
+      parameter = param,
+      as.list(score_error(parameter_error[, param, ]))
+    )
+  })
+)
+
+print(parameter_summary)
+
+# S2 locations are redrawn in every replication: report pooled random-site errors.
+unconditional_volatility_summary <- as.data.frame(
+  as.list(
+    score_error(pred_vol_S2_MC - true_vol_S2_MC)
+  )
+)
+
+print(unconditional_volatility_summary)
+
+# ==============================================================================
+# Illustrations from the final replication
+# ==============================================================================
+
+plot_rep <- MC
+
+pred_params_S0 <- estimated_params_S0_MC[, , plot_rep]
+t_true_params_S0 <- true_params_S0_MC[, , plot_rep]
+
+pred_vol_S0 <- sqrt(
+  pred_params_S0[, "omega"] /
+    (
+      1 - rowSums(
+        pred_params_S0[, c("alpha", "beta"), drop = FALSE]
+      )
+    )
+)
+
+true_vol_S0 <- sqrt(
+  t_true_params_S0[, "omega"] /
+    (
+      1 - rowSums(
+        t_true_params_S0[, c("alpha", "beta"), drop = FALSE]
+      )
+    )
+)
+
+pred_vol_S0_grid <- matrix(
+  pred_vol_S0, grid_size, grid_size
+)
+
+true_vol_S0_grid <- matrix(
+  true_vol_S0, grid_size, grid_size
+)
+
+image(
+  x_vals, y_vals, pred_vol_S0_grid,
+  col = heat.colors(100),
+  xlab = "X",
+  ylab = "Y",
+  main = "Unconditional volatility on S0"
+)
+
+contour_levels <- pretty(
+  range(c(pred_vol_S0, true_vol_S0)),
+  n = 6
+)
+
+contour(
+  x_vals, y_vals, pred_vol_S0_grid,
+  add = TRUE,
+  levels = contour_levels,
+  col = "red",
+  lty = 2,
+  lwd = 1
+)
+
+contour(
+  x_vals, y_vals, true_vol_S0_grid,
+  add = TRUE,
+  levels = contour_levels,
+  col = "black",
+  lty = 1,
+  lwd = 2
+)
+
+legend(
+  "topright",
+  legend = c("Estimated", "True"),
+  col = c("red", "black"),
+  lty = c(2, 1),
+  lwd = c(1, 2),
+  bg = "white"
+)
+
+# Conditional-volatility trajectories: true versus both prediction methods.
+local({
+
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+
+  par(
+    mfrow = c(min(3L, n2), 1L),
+    mar = c(4, 4, 2, 1)
+  )
+
+  time_index <- seq.int(2L, T)
+
+  for (i in seq_len(min(3L, n2))) {
+
+    trajectories <- cbind(
+      True = sqrt(
+        sigma2_true_S2_MC[-1L, i, plot_rep]
+      ),
+      Xi = sqrt(
+        sigma2_pred_by_method$xi_blp[-1L, i, plot_rep]
+      ),
+      Eta = sqrt(
+        sigma2_pred_by_method$eta_gaussian[-1L, i, plot_rep]
+      )
+    )
+
+    matplot(
+      time_index,
+      trajectories,
+      type = "l",
+      lwd = c(2, 1.5, 1.5),
+      col = c("black", "steelblue", "red"),
+      lty = c(1, 2, 3),
+      xlab = "Time",
+      ylab = "Conditional volatility",
+      main = paste("S2 location", i)
+    )
+
+    legend(
+      "topright",
+      legend = c("True", "Xi BLP", "Eta Gaussian"),
+      col = c("black", "steelblue", "red"),
+      lty = c(1, 2, 3),
+      bty = "n"
+    )
+  }
+})
+```
+
+
+
+# Empirical applications
+
+We illustrate the flexibility of the heterogeneous STGARCH model through two applications in distinct spatial settings. The first examines residual volatility in daily PM$_{10}$ concentrations across an irregular network of monitoring stations in Italy, where location is defined geographically and volatility represents time-varying model uncertainty. The second studies daily stock returns in a financial network, where firms are embedded in a latent economic space constructed from balance-sheet characteristics. Together, the applications demonstrate how the model can estimate spatially heterogeneous volatility dynamics and predict volatility at locations or firms excluded from model estimation.
+
+## Financial network application
+
+The financial application considers daily log returns for 50 publicly traded firms observed over 276 trading days in 2019. Because no physical coordinates or directly observed network are available, the firms are embedded in two-dimensional proxy spaces constructed from standardized balance-sheet variables. After preprocessing, 44 financial features remain, yielding 946 possible pairwise proxy spaces. For each space, predictive performance is evaluated by five-fold cross-validation, with the complete return history of each test firm withheld and its volatility predicted from economically similar training firms. The same fold assignments are used throughout, allowing the candidate proxy spaces and the two spatial prediction methods to be compared on a common basis.
+
+### Financial data preprocessing
+
+The preprocessing follows Fülle and Otto (2024). The code below preserves the computational steps of the original implementation; only unused diagnostic commands have been removed and the formatting and documentation have been standardised.
+
+Fülle, M. J., & Otto, P. (2024). Spatial GARCH models for unknown spatial locations–an application to financial stock returns. Spatial Economic Analysis, 19(1), 92-105.
+
+```{r}
+#| label: financial-data-preprocessing
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| code-fold: true
+#| code-summary: "Show full code for data pre-processing"
+
+# Required packages
+library(xts)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Load the financial statements and stock-price series.
+load("Finance_example/workspace.RData")
+
+
+# ==============================================================================
+# Balance-sheet covariates
+# ==============================================================================
+
+# Convert the financial data to a numeric matrix.
+A <- data.matrix(financials)
+
+# The data contain alternating annual observations. The odd-numbered rows
+# correspond to the observations used for 2019.
+row_index <- seq_len(nrow(A))
+row_index <- row_index[row_index %% 2L != 0L]
+
+A_2019 <- A[row_index, ]
+
+# Retain the 66 balance-sheet variables used in the empirical analysis.
+A_2019 <- A_2019[, 2:68]
+A_2019 <- A_2019[, c(1:60, 62:67)]
+
+# Harmonise the units of firms whose financial variables are reported on a
+# scale differing by a factor of 1,000. These corrections reproduce the
+# preprocessing of the original dataset.
+A_2019["Samsung_Electronics", ] <-
+  A_2019["Samsung_Electronics", ] / 1000
+
+A_2019[18, ] <- A_2019[18, ] / 1000
+A_2019[30, ] <- A_2019[30, ] / 1000
+A_2019[47, ] <- A_2019[47, ] / 1000
+A_2019[27, ] <- A_2019[27, ] / 1000
+A_2019[23, ] <- A_2019[23, ] / 1000
+A_2019[12, ] <- A_2019[12, ] / 1000
+A_2019[8, ]  <- A_2019[8, ] / 1000
+A_2019[7, ]  <- A_2019[7, ] / 1000
+
+# Standardise each covariate across firms.
+A_stand <- apply(
+  A_2019,
+  MARGIN = 2,
+  FUN = function(x) {
+    (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+  }
+)
+
+# Missing standardised values are replaced by zero, corresponding to the
+# cross-sectional mean of the respective covariate.
+A_stand[is.na(A_stand)] <- 0
+A_stand <- as.matrix(A_stand)
+
+
+# ==============================================================================
+# Stock-price series
+# ==============================================================================
+
+# Extract the price series for the 50 firms. Five observations are removed from
+# the BNP Paribas series to reproduce the alignment used in the original data.
+stock_list <- list(
+  Allianz = Allianz[, 1],
+  Abbott = Abbott_Laboratories[, 1],
+  Apple = Apple[, 1],
+  ATT = ATT[, 1],
+  Santander = Banco_Santander[, 1],
+  BofA = Bank_of_America[, 1],
+  BHP = BHP_Billiton[, 1],
+  BNP = BNP_Paribas[-c(111, 194, 252, 253, 256), 1],
+  BP = BP[, 1],
+  Chevron = Chevron[, 1],
+  Cisco = Cisco[, 1],
+  Citi = Citigroup[, 1],
+  CocaCola = Coca_Cola[, 1],
+  Conoco = ConocoPhillips[, 1],
+  EON = E.ON[, 1],
+  Eni = Eni[, 1],
+  Exxon = Exxon_Mobil[, 1],
+  Gazprom = Gazprom[, 1],
+  GE = General_Electric[, 1],
+  GSK = GlaxoSmithKline[, 1],
+  Google = Google[, 1],
+  HP = Hewlett_Packard[, 1],
+  HSBC = HSBC[, 1],
+  IBM = IBM[, 1],
+  Intel = Intel[, 1],
+  JnJ = Johnson_Johnson[, 1],
+  JPM = JPMorgan_Chase_Co.[, 1],
+  Merck = Merck_Co_Inc.[, 1],
+  Microsoft = Microsoft[, 1],
+  MUFG = Mitsubishi_UFJ_Financial_Group[, 1],
+  Nestle = Nestlé[, 1],
+  Novartis = Novartis[, 1],
+  Oracle = Oracle[, 1],
+  Pepsi = PepsiCo[, 1],
+  Petrobras = Petrobras[, 1],
+  Pfizer = Pfizer[, 1],
+  PMI = Philip_Morris_International[, 1],
+  PG = Procter_Gamble[, 1],
+  Roche = Roche[, 1],
+  Shell = Royal_Dutch_Shell[, 1],
+  Samsung = Samsung_Electronics[, 1],
+  Sanofi = Sanofi_Aventis[, 1],
+  Schlumberger = Schlumberger[, 1],
+  Siemens = Siemens[, 1],
+  Telefonica = Telefónica[, 1],
+  Total = Total[, 1],
+  Toyota = Toyota[, 1],
+  Verizon = Verizon_Communications[, 1],
+  Vodafone = Vodafone_Group[, 1],
+  Walmart = Wal_Mart[, 1]
+)
+
+# Preserve the date index used in the original analysis.
+Dates <- zoo::index(Allianz)
+
+
+# ==============================================================================
+# Daily log-returns
+# ==============================================================================
+
+# Compute continuously compounded daily returns for each firm.
+log_returns_list <- lapply(
+  stock_list,
+  function(prices) {
+    prices <- as.numeric(prices)
+
+    if (length(prices) >= 2L) {
+      diff(log(prices))
+    } else {
+      NULL
+    }
+  }
+)
+
+# Combine the firm-specific return series in long format. Series are aligned by
+# their sequential observation index, as in the original implementation.
+panel_returns <- do.call(
+  rbind,
+  lapply(
+    names(log_returns_list),
+    function(firm_name) {
+      firm_returns <- log_returns_list[[firm_name]]
+
+      if (!is.null(firm_returns)) {
+        data.frame(
+          firm = firm_name,
+          time = seq_along(firm_returns),
+          return = firm_returns
+        )
+      } else {
+        NULL
+      }
+    }
+  )
+)
+
+# Convert the return panel to wide format, with one column per firm.
+panel_wide <- tidyr::pivot_wider(
+  data = panel_returns,
+  names_from = firm,
+  values_from = return
+)
+
+
+# ==============================================================================
+# Exploratory plot
+# ==============================================================================
+
+# Convert the return panel back to long format for plotting.
+panel_long_plot <- panel_wide %>%
+  tidyr::pivot_longer(
+    cols = -time,
+    names_to = "firm",
+    values_to = "return"
+  )
+
+# Display the first nine firms in alphabetical order.
+firms_to_plot <- sort(unique(panel_long_plot$firm))[1:9]
+
+panel_long_plot_subset <- dplyr::filter(
+  panel_long_plot,
+  firm %in% firms_to_plot
+)
+
+ggplot(
+  panel_long_plot_subset,
+  aes(
+    x = time,
+    y = return,
+    colour = firm
+  )
+) +
+  geom_line(alpha = 0.8) +
+  facet_wrap(
+    ~ firm,
+    scales = "free_y",
+    ncol = 3
+  ) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Daily log-returns for selected firms",
+    x = "Time index (days)",
+    y = "Log-return",
+    colour = "Firm"
+  )
+
+
+# ==============================================================================
+# Return matrix used for model estimation
+# ==============================================================================
+
+logreturns <- as.matrix(panel_wide[, -1])
+
+# Series of unequal length generate a small number of missing observations.
+# Following the original implementation, these values are replaced by draws
+# from a centred Gaussian distribution with standard deviation 0.001.
+#
+# This step is stochastic. Exact replication requires the random seed used for
+# the original analysis to be set before this command.
+logreturns[is.na(logreturns)] <- rnorm(
+  n = sum(is.na(logreturns)),
+  mean = 0,
+  sd = 0.001
+)
+```
+
+### Selection of the financial proxy space
+
+All pairs of balance-sheet variables with less than 5% missingness are considered as candidate two-dimensional proxy spaces. For each space, predictive performance is evaluated using the same five-fold cross-validation partition. The folds leave out complete firm-level time series. Spatially varying GARCH parameters are estimated from the training firms, and the squared process is predicted at the held-out firms by kriging the estimated innovation process.
+
+The exhaustive search considers all admissible covariate pairs and is computationally intensive. The full code is provided below for reproducibility. The subsequent chunk loads the corresponding pre-computed results.
+
+
+```{r}
+#| label: financial-proxy-space-selection
+#| eval: false
+#| message: true
+#| warning: true
+#| code-fold: true
+#| code-summary: "Show financial proxy-space cross-validation"
+
+source("stgarch_spatial_estimation_parallelCV.R")
+
+if (!requireNamespace("future", quietly = TRUE) ||
+    !requireNamespace("future.apply", quietly = TRUE)) {
+  stop("Install future and future.apply before running this block.")
+}
+
+logreturns <- as.matrix(logreturns)
+A_stand <- as.matrix(A_stand)
+n <- ncol(logreturns)
+T <- nrow(logreturns)
+
+if (!is.numeric(logreturns) || !is.numeric(A_stand) ||
+    nrow(A_stand) != n || n < 5L || T < 3L ||
+    any(!is.finite(logreturns^2)) || any(!is.finite(A_stand))) {
+  stop("Supply finite logreturns (times x firms) and A_stand (firms x covariates), ",
+       "with corresponding firm order and at least five firms.")
+}
+
+finance_lb <- c(omega = 1e-12, alpha = 0, beta = 0)
+finance_ub <- c(omega = 1, alpha = 1, beta = 1)
+finance_theta_init <- c(omega = 1e-5, alpha = 0.05, beta = 0.90)
+
+# ==============================================================================
+# Candidate two-dimensional financial proxy spaces
+# ==============================================================================
+
+# Retain the original zero-based filtering rule. It measures missingness only
+# if the preprocessing used zeros exclusively to mark imputed missing values.
+zero_proportion <- colMeans(A_stand == 0)
+candidate_indices <- which(zero_proportion < 0.05)
+if (length(candidate_indices) < 2L) {
+  stop("Fewer than two covariates remain after filtering.")
+}
+
+# Preserve the original ordering of pair indices for downstream code.
+pairs <- expand.grid(i = candidate_indices, j = candidate_indices)
+pairs <- pairs[pairs$i < pairs$j, , drop = FALSE]
+rownames(pairs) <- NULL
+
+covariate_names <- colnames(A_stand)
+if (is.null(covariate_names)) {
+  covariate_names <- paste0("V", seq_len(ncol(A_stand)))
+}
+
+# ==============================================================================
+# Identical folds for every proxy space and both predictors
+# ==============================================================================
+
+n_folds <- 5L
+seed <- 5515L
+set.seed(seed)
+folds <- rep(seq_len(n_folds), length.out = n)[sample(seq_len(n))]
+
+common_arguments <- list(
+  Z = logreturns,
+  theta_init = finance_theta_init,
+  lower = finance_lb,
+  upper = finance_ub,
+  weight_function = a2d_sepgauss,
+  bandwidth_function = default_bandwidth,
+  stationarity_margin = 1e-4,
+  epsilon = 1e-8,
+  folds = folds,
+  # Parallelize across proxy spaces, not within a proxy-space fit.
+  parallel = FALSE,
+  progress = FALSE
+)
+
+# ==============================================================================
+# Compact results: retain both squared-process and variance predictions
+# ==============================================================================
+
+failed_fit <- function(message, bandwidth = NA_real_, warnings = character()) {
+  list(
+    Z_pred_S2 = NULL,
+    sigma2_pred_S2 = NULL,
+    RMSE_vol = NA_real_,
+    MAE_vol = NA_real_,
+    evaluation_coverage = 0,
+    bandwidth = bandwidth,
+    covariance_fits = list(),
+    error = message,
+    warnings = warnings
+  )
+}
+
+compact_fit <- function(fit, warnings) {
+  list(
+    Z_pred_S2 = fit$Z_pred_S2,
+    sigma2_pred_S2 = fit$sigma2_pred_S2,
+    RMSE_vol = fit$RMSE_vol,
+    MAE_vol = fit$MAE_vol,
+    evaluation_coverage = fit$evaluation_coverage,
+    bandwidth = fit$bandwidth,
+    covariance_fits = fit$covariance_fits,
+    error = NA_character_,
+    warnings = warnings
+  )
+}
+
+fit_one_proxy_space <- function(pair_index) {
+  indices <- c(pairs$i[pair_index], pairs$j[pair_index])
+  coords_pair <- A_stand[, indices, drop = FALSE]
+  b_pair <- NA_real_
+
+  design_error <- tryCatch({
+    if (anyDuplicated(as.data.frame(coords_pair))) {
+      stop("Duplicate firm coordinates: the current nugget model requires distinct sites.")
+    }
+    if (qr(cbind(1, coords_pair))$rank < 3L) {
+      stop("The candidate coordinates do not span a two-dimensional space.")
+    }
+    b_pair <- common_arguments$bandwidth_function(coords_pair[, 1], coords_pair[, 2])
+    if (length(b_pair) != 1L || !is.finite(b_pair) || b_pair <= 0) {
+      stop("Invalid bandwidth for this proxy space.")
+    }
+    supported <- vapply(seq_len(n), function(i) {
+      train <- folds != folds[i]
+      w <- common_arguments$weight_function(
+        coords_pair[train, 1] - coords_pair[i, 1],
+        coords_pair[train, 2] - coords_pair[i, 2],
+        b_pair
+      )
+      any(w > 0)
+    }, logical(1))
+    if (!all(supported)) {
+      stop(sum(!supported), " held-out firms have no training kernel support ",
+           "at bandwidth ", signif(b_pair, 5), ". Firm indices: ",
+           paste(which(!supported), collapse = ", "))
+    }
+    NULL
+  }, error = function(e) conditionMessage(e))
+
+  if (!is.null(design_error)) {
+    return(list(pair_index = pair_index,
+                xi_blp = failed_fit(design_error, b_pair),
+                eta_gaussian = failed_fit(design_error, b_pair)))
+  }
+
+  run_predictor <- function(predictor_name) {
+    fit_warnings <- character()
+    tryCatch({
+      fit <- withCallingHandlers(
+        do.call(
+          fit_stgarch_spatial_cv,
+          c(common_arguments, list(coords = coords_pair,
+                                   bandwidth = b_pair,
+                                   predictor = predictor_name))
+        ),
+        warning = function(w) {
+          fit_warnings <<- unique(c(fit_warnings, conditionMessage(w)))
+          invokeRestart("muffleWarning")
+        }
+      )
+      compact_fit(fit, fit_warnings)
+    }, error = function(e) failed_fit(conditionMessage(e), b_pair, fit_warnings))
+  }
+
+  list(pair_index = pair_index,
+       xi_blp = run_predictor("xi_blp"),
+       eta_gaussian = run_predictor("eta_gaussian"))
+}
+
+# ==============================================================================
+# Parallel search with restoration of the previous future plan
+# ==============================================================================
+
+## for testing:
+pairs <- pairs[1:5, ]
+
+
+n_workers <- 5L
+previous_plan <- future::plan("list")
+pair_results <- tryCatch({
+  future::plan(future::multisession, workers = n_workers)
+  future.apply::future_lapply(
+    seq_len(nrow(pairs)), fit_one_proxy_space,
+    future.seed = seed, future.globals = TRUE, future.scheduling = 2
+  )
+}, finally = future::plan(previous_plan))
+
+output_xi <- lapply(pair_results, `[[`, "xi_blp")
+output_eta <- lapply(pair_results, `[[`, "eta_gaussian")
+
+RMSE_xi <- vapply(output_xi, `[[`, numeric(1), "RMSE_vol")
+RMSE_eta <- vapply(output_eta, `[[`, numeric(1), "RMSE_vol")
+MAE_xi <- vapply(output_xi, `[[`, numeric(1), "MAE_vol")
+MAE_eta <- vapply(output_eta, `[[`, numeric(1), "MAE_vol")
+coverage_xi <- vapply(output_xi, `[[`, numeric(1), "evaluation_coverage")
+coverage_eta <- vapply(output_eta, `[[`, numeric(1), "evaluation_coverage")
+
+comparison_rows <- function(results, predictor) {
+  data.frame(
+    pair_index = seq_len(nrow(pairs)),
+    covariate_1_index = pairs$i,
+    covariate_2_index = pairs$j,
+    covariate_1 = covariate_names[pairs$i],
+    covariate_2 = covariate_names[pairs$j],
+    predictor = predictor,
+    RMSE = vapply(results, `[[`, numeric(1), "RMSE_vol"),
+    MAE = vapply(results, `[[`, numeric(1), "MAE_vol"),
+    coverage = vapply(results, `[[`, numeric(1), "evaluation_coverage"),
+    bandwidth = vapply(results, `[[`, numeric(1), "bandwidth"),
+    error = vapply(results, `[[`, character(1), "error"),
+    warnings = vapply(results, function(x) paste(x$warnings, collapse = " | "), character(1)),
+    stringsAsFactors = FALSE
+  )
+}
+
+proxy_space_comparison <- rbind(
+  comparison_rows(output_xi, "xi_blp"),
+  comparison_rows(output_eta, "eta_gaussian")
+)
+rownames(proxy_space_comparison) <- NULL
+proxy_space_comparison$eligible <- with(
+  proxy_space_comparison,
+  is.na(error) & coverage == 1 & is.finite(RMSE) & is.finite(MAE)
+)
+
+# Rank only complete, successful evaluations, separately for each method.
+# Recorded covariance warnings should still be reviewed before interpretation.
+ranked_proxy_spaces <- proxy_space_comparison[proxy_space_comparison$eligible, ]
+ranked_proxy_spaces <- ranked_proxy_spaces[
+  order(ranked_proxy_spaces$predictor, ranked_proxy_spaces$RMSE),
+  , drop = FALSE
+]
+
+# Compatibility aliases for downstream code using xi-BLP as the primary method.
+RMSE <- RMSE_xi
+output <- output_xi
+
+# ==============================================================================
+# Save results, including failures and the exact settings used
+# ==============================================================================
+
+financial_results_file <- file.path("Finance_example", "financial_proxy_space_CV_results.rds")
+dir.create(dirname(financial_results_file), recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  list(
+    pairs = pairs, folds = folds, zero_proportion = zero_proportion,
+    covariate_names = covariate_names,
+    proxy_space_comparison = proxy_space_comparison,
+    ranked_proxy_spaces = ranked_proxy_spaces,
+    output_xi = output_xi, output_eta = output_eta,
+    RMSE_xi = RMSE_xi, RMSE_eta = RMSE_eta,
+    MAE_xi = MAE_xi, MAE_eta = MAE_eta,
+    coverage_xi = coverage_xi, coverage_eta = coverage_eta,
+    settings = list(
+      theta_init = finance_theta_init, lower = finance_lb, upper = finance_ub,
+      stationarity_margin = common_arguments$stationarity_margin,
+      epsilon = common_arguments$epsilon,
+      kernel = "separable Gaussian", bandwidth_rule = "default_bandwidth",
+      score = "sqrt(sigma2_pred_S2) versus abs(logreturns), rows 2:T",
+      n_folds = n_folds, seed = seed, n_workers = n_workers
+    )
+  ),
+  file = financial_results_file,
+  compress = "xz"
+)
+
+print(with(proxy_space_comparison, table(predictor, eligible)))
+print(utils::head(ranked_proxy_spaces[ranked_proxy_spaces$predictor == "xi_blp", ], 5L))
+print(utils::head(ranked_proxy_spaces[ranked_proxy_spaces$predictor == "eta_gaussian", ], 5L))
+
+if (any(nzchar(proxy_space_comparison$warnings))) {
+  warning("Some fits issued covariance warnings; review the saved warnings column.")
+}
+if (any(!proxy_space_comparison$eligible)) {
+  warning("Some candidate-method combinations failed and were excluded from ranking. ",
+          "See the saved error column; no partial-data RMSE was used.")
+}
+if (!nrow(ranked_proxy_spaces)) {
+  stop("No candidate yielded a complete CV result. Diagnostics were saved to ",
+       financial_results_file, ". Review kernel support, bounds, and fit errors.")
+}
+
+
+
+```
+
+
+Load pre-computed results
+
+```{r}
+#| label: load-financial-proxy-space-results
+#| message: false
+#| warning: false
+
+financial_results_file <- file.path(
+  "Finance_example",
+  "financial_proxy_space_CV_results.rds"
+)
+
+if (!file.exists(financial_results_file)) {
+  stop(
+    "The pre-computed financial cross-validation results ",
+    "were not found at: ",
+    financial_results_file
+  )
+}
+
+financial_results <- readRDS(financial_results_file)
+
+# Candidate spaces, common folds, and estimation settings.
+pairs <- financial_results$pairs
+folds <- financial_results$folds
+zero_proportion <- financial_results$zero_proportion
+covariate_names <- financial_results$covariate_names
+financial_settings <- financial_results$settings
+
+proxy_space_comparison <- financial_results$proxy_space_comparison
+ranked_proxy_spaces <- financial_results$ranked_proxy_spaces
+
+# Predictions and scores for both methods.
+output_xi <- financial_results$output_xi
+output_eta <- financial_results$output_eta
+
+RMSE_xi <- financial_results$RMSE_xi
+RMSE_eta <- financial_results$RMSE_eta
+MAE_xi <- financial_results$MAE_xi
+MAE_eta <- financial_results$MAE_eta
+
+coverage_xi <- financial_results$coverage_xi
+coverage_eta <- financial_results$coverage_eta
+
+
+###
+# Select the method used by subsequent tables and figures.
+predictor <- "eta_gaussian"  # Alternatively: "xi_blp"
+#
+###
+
+
+predictor <- match.arg(
+  predictor,
+  c("xi_blp", "eta_gaussian")
+)
+
+if (predictor == "xi_blp") {
+  output <- output_xi
+  RMSE <- RMSE_xi
+  MAE <- MAE_xi
+  coverage <- coverage_xi
+} else {
+  output <- output_eta
+  RMSE <- RMSE_eta
+  MAE <- MAE_eta
+  coverage <- coverage_eta
+}
+
+stopifnot(
+  length(output) == nrow(pairs),
+  length(RMSE) == nrow(pairs),
+  length(MAE) == nrow(pairs),
+  length(coverage) == nrow(pairs)
+)
+
+# Rank only candidates with complete, finite evaluation scores.
+eligible <- is.finite(RMSE) &
+  is.finite(MAE) &
+  !is.na(coverage) &
+  coverage == 1
+
+ranked_pair_indices <- which(eligible)
+ranked_pair_indices <- ranked_pair_indices[
+  order(RMSE[ranked_pair_indices])
+]
+
+if (!length(ranked_pair_indices)) {
+  stop(
+    "No complete CV results are available for ", predictor, ". ",
+    "Inspect proxy_space_comparison$error."
+  )
+}
+
+```
+
+### Identify the relevant proxy spaces
+
+The best-performing proxy space is used for the cross-validated volatility
+predictions. The space, defined by other current liabilities and
+long-term debt, is used for the detailed parameter-surface analysis because it
+has a clearer economic interpretation.
+
+```{r}
+#| label: identify-financial-proxy-spaces
+#| message: false
+#| warning: false
+
+# Use the names saved with the CV results, not a potentially changed A_stand.
+if (
+  is.null(covariate_names) ||
+  length(covariate_names) < max(c(pairs$i, pairs$j))
+) {
+  stop("The saved covariate names are missing or inconsistent with pairs.")
+}
+
+pair_summary <- data.frame(
+  model_id = seq_len(nrow(pairs)),
+  variable_1 = covariate_names[as.integer(pairs$i)],
+  variable_2 = covariate_names[as.integer(pairs$j)],
+  RMSE = RMSE,
+  MAE = MAE,
+  coverage = coverage,
+  stringsAsFactors = FALSE
+)
+
+pair_summary$eligible <- with(
+  pair_summary,
+  is.finite(RMSE) &
+    is.finite(MAE) &
+    !is.na(coverage) &
+    coverage == 1
+)
+
+# Return the model ID, irrespective of variable order or table row order.
+find_pair_id <- function(variable_1, variable_2, pair_table) {
+  matching_rows <- which(
+    (
+      pair_table$variable_1 == variable_1 &
+        pair_table$variable_2 == variable_2
+    ) |
+      (
+        pair_table$variable_1 == variable_2 &
+          pair_table$variable_2 == variable_1
+      )
+  )
+
+  if (length(matching_rows) != 1L) {
+    stop(
+      "Could not identify a unique proxy space for `",
+      variable_1, "` and `", variable_2, "`."
+    )
+  }
+
+  pair_table$model_id[matching_rows]
+}
+
+# Rank only complete, successful candidate evaluations.
+ranked_rows <- which(pair_summary$eligible)
+
+if (!length(ranked_rows)) {
+  stop("No eligible proxy spaces are available for the selected predictor.")
+}
+
+ranked_rows <- ranked_rows[
+  order(pair_summary$RMSE[ranked_rows])
+]
+
+best_id <- pair_summary$model_id[ranked_rows[1L]]
+
+# Preserve this variable name for subsequent code.
+top5_idx <- pair_summary$model_id[
+  head(ranked_rows, 5L)
+]
+
+if (!pair_summary$eligible[best_id]) {
+  stop(
+    "The selected proxy space does not have a complete, valid CV result ",
+    "for ", predictor, ". Inspect proxy_space_comparison$error."
+  )
+}
+
+# Table of the best-performing candidates.
+# The explicitly selected space need not belong to this top-five table.
+proxy_space_results <- pair_summary[
+  match(top5_idx, pair_summary$model_id),
+  c("model_id", "variable_1", "variable_2", "RMSE"),
+  drop = FALSE
+]
+
+method_label <- switch(
+  predictor,
+  xi_blp = "squared-innovation BLP",
+  eta_gaussian = "Gaussian conditional-moment predictor"
+)
+
+knitr::kable(
+  proxy_space_results,
+  digits = 5,
+  row.names = FALSE,
+  caption = paste0(
+    "Best-performing financial proxy spaces using the ",
+    method_label,
+    "."
+  )
+)
+```
+
+
+### Distribution of returns and absolute returns
+
+Figure 3 summarises the distribution of daily log-returns and absolute
+log-returns over firms and trading days.
+
+```{r}
+#| label: fig-financial-return-boxplots
+#| layout-ncol: 2
+#| fig-width: 7
+#| fig-height: 5
+#| fig-cap:
+#|   - "Distribution of log-returns over time."
+#|   - "Distribution of absolute log-returns over time."
+#|   - "Distribution of log-returns across firms."
+#|   - "Distribution of absolute log-returns across firms."
+#| message: false
+#| warning: false
+
+# Convert the return matrix to long format.
+df_logret <- reshape2::melt(logreturns)
+
+colnames(df_logret) <- c(
+  "Time",
+  "Firm",
+  "LogReturn"
+)
+
+df_logret$AbsLogReturn <- abs(df_logret$LogReturn)
+
+# Distribution of log-returns over trading days.
+plot_returns_time <- ggplot(
+  df_logret,
+  aes(
+    x = as.factor(Time),
+    y = LogReturn
+  )
+) +
+  geom_boxplot(outlier.size = 0.4) +
+  labs(
+    title = "Distribution of log-returns over time",
+    x = "Time (trading days)",
+    y = "Log-return"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# Distribution of absolute log-returns over trading days.
+plot_volatility_time <- ggplot(
+  df_logret,
+  aes(
+    x = as.factor(Time),
+    y = AbsLogReturn
+  )
+) +
+  geom_boxplot(outlier.size = 0.4) +
+  labs(
+    title = "Distribution of absolute log-returns over time",
+    x = "Time (trading days)",
+    y = "Absolute log-return"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# Distribution of log-returns across firms.
+plot_returns_firms <- ggplot(
+  df_logret,
+  aes(
+    x = as.factor(Firm),
+    y = LogReturn
+  )
+) +
+  geom_boxplot(outlier.size = 0.7) +
+  labs(
+    title = "Distribution of log-returns across firms",
+    x = "Firm",
+    y = "Log-return"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# Distribution of absolute log-returns across firms.
+plot_volatility_firms <- ggplot(
+  df_logret,
+  aes(
+    x = as.factor(Firm),
+    y = AbsLogReturn
+  )
+) +
+  geom_boxplot(outlier.size = 0.7) +
+  labs(
+    title = "Distribution of absolute log-returns across firms",
+    x = "Firm",
+    y = "Absolute log-return"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+plot_returns_time
+plot_volatility_time
+plot_returns_firms
+plot_volatility_firms
+```
+
+### Variables recurring among the best proxy spaces
+
+Figure 4 shows how frequently each balance-sheet variable occurs among the 30
+best-performing proxy spaces and displays the corresponding undirected network.
+
+```{r}
+#| label: fig-top-proxy-space-network
+#| fig-width: 13.5
+#| fig-height: 6
+#| fig-cap: "Variable frequencies and co-occurrence among up to 30 best-performing eligible proxy spaces for the selected predictor. Thicker edges indicate better CV-RMSE ranks."
+#| message: false
+#| warning: false
+
+# Select up to 30 eligible proxy spaces for the currently selected predictor.
+top_k <- 30L
+
+eligible_rows <- which(pair_summary$eligible)
+
+eligible_rows <- eligible_rows[
+  order(pair_summary$RMSE[eligible_rows])
+]
+
+top_rows <- head(eligible_rows, top_k)
+
+if (!length(top_rows)) {
+  stop("No eligible proxy spaces are available for this figure.")
+}
+
+top_ids <- pair_summary$model_id[top_rows]
+top_pairs <- pairs[top_ids, , drop = FALSE]
+top_rmse <- pair_summary$RMSE[top_rows]
+
+# Use the actual number selected in all labels and calculations.
+top_k <- length(top_ids)
+
+# Use the covariate names saved with the estimation results.
+variable_names <- covariate_names
+
+if (
+  is.null(variable_names) ||
+  length(variable_names) < max(c(top_pairs$i, top_pairs$j))
+) {
+  stop("The saved covariate names are missing or inconsistent with pairs.")
+}
+
+# Count variable occurrences among the selected pairs.
+top_variable_ids <- c(
+  as.integer(top_pairs$i),
+  as.integer(top_pairs$j)
+)
+
+variable_frequency <- sort(
+  table(variable_names[top_variable_ids]),
+  decreasing = TRUE
+)
+
+# Assign consistent short labels for both panels.
+variable_labels <- if (length(variable_frequency) <= length(LETTERS)) {
+  LETTERS[seq_along(variable_frequency)]
+} else {
+  paste0("V", seq_along(variable_frequency))
+}
+
+names(variable_labels) <- names(variable_frequency)
+
+# Construct the network: each edge represents a selected variable pair.
+edge_data <- data.frame(
+  from = variable_names[as.integer(top_pairs$i)],
+  to = variable_names[as.integer(top_pairs$j)],
+  rank = seq_len(top_k),
+  RMSE = top_rmse,
+  stringsAsFactors = FALSE
+)
+
+# Better-ranked proxy spaces receive larger edge weights.
+edge_data$weight <- rev(seq_len(top_k))
+
+edge_data_aggregated <- aggregate(
+  weight ~ from + to,
+  data = edge_data,
+  FUN = sum
+)
+
+proxy_graph <- igraph::graph_from_data_frame(
+  edge_data_aggregated,
+  directed = FALSE
+)
+
+vertex_frequency <- table(
+  c(edge_data$from, edge_data$to)
+)
+
+igraph::V(proxy_graph)$frequency <- as.numeric(
+  vertex_frequency[igraph::V(proxy_graph)$name]
+)
+
+igraph::V(proxy_graph)$label <- unname(
+  variable_labels[igraph::V(proxy_graph)$name]
+)
+
+igraph::V(proxy_graph)$size_scaled <-
+  8 + 2.8 * igraph::V(proxy_graph)$frequency
+
+# Scale edge widths safely, including single-edge or equal-weight cases.
+edge_weight <- igraph::E(proxy_graph)$weight
+weight_range <- range(edge_weight)
+
+if (
+  length(edge_weight) > 1L &&
+  diff(weight_range) > 0
+) {
+  igraph::E(proxy_graph)$width_scaled <-
+    0.8 + 3.2 *
+      (edge_weight - weight_range[1]) /
+      diff(weight_range)
+} else {
+  igraph::E(proxy_graph)$width_scaled <- rep(
+    2,
+    length(edge_weight)
+  )
+}
+
+# Restore graphical settings even if plotting fails.
+local({
+  old_par <- par(no.readonly = TRUE)
+
+  on.exit({
+    layout(1)
+    par(old_par)
+  })
+  
+  # pdf("proxy_space_features_network.pdf", width = 13.5, height = 6)
+  
+  layout(
+    matrix(c(1, 2), nrow = 1),
+    widths = c(1.35, 1.15)
+  )
+
+  # ---------------------------------------------------------------------------
+  # Panel (a): occurrence frequencies
+  # ---------------------------------------------------------------------------
+
+  par(mar = c(5, 5, 4, 2))
+
+  frequency_values <- rev(as.integer(variable_frequency))
+  frequency_labels <- rev(unname(variable_labels))
+  frequency_names <- rev(names(variable_frequency))
+
+  x_limit <- max(frequency_values) + 3.2
+
+  bar_positions <- barplot(
+    frequency_values,
+    horiz = TRUE,
+    las = 1,
+    col = "grey80",
+    border = "grey35",
+    names.arg = frequency_labels,
+    xlim = c(0, x_limit),
+    xlab = paste0(
+      "Frequency among top ",
+      top_k,
+      " proxy spaces"
+    ),
+    main = "(a) Recurring variables"
+  )
+
+  text(
+    x = frequency_values + 0.25,
+    y = bar_positions,
+    labels = frequency_names,
+    adj = 0,
+    cex = 0.62
+  )
+
+  # ---------------------------------------------------------------------------
+  # Panel (b): network of selected proxy spaces
+  # ---------------------------------------------------------------------------
+
+  par(mar = c(1, 1, 4, 1))
+
+  set.seed(5515L)
+
+  network_layout <- igraph::layout_with_fr(
+    proxy_graph,
+    niter = 10000
+  )
+
+  plot(
+    proxy_graph,
+    layout = network_layout,
+    vertex.size = igraph::V(proxy_graph)$size_scaled,
+    vertex.label = igraph::V(proxy_graph)$label,
+    vertex.label.cex = 0.85,
+    vertex.label.color = "black",
+    vertex.color = "grey88",
+    vertex.frame.color = "grey35",
+    edge.width = igraph::E(proxy_graph)$width_scaled,
+    edge.color = "grey65",
+    edge.curved = 0.08,
+    main = "(b) Network of top proxy spaces"
+  )
+  
+  # dev.off()
+  
+})
+```
+
+
+### Bootstrap uncertainty of predictive performance
+
+The bootstrap resamples firms with replacement while retaining the complete time series of each selected firm. The full computation is displayed below but is not executed during rendering.
+
+```{r}
+#| label: compute-proxy-space-bootstrap
+#| eval: false
+#| code-fold: true
+#| code-summary: "Show paired time-block bootstrap for the best proxy spaces"
+#| message: false
+#| warning: false
+
+if (!requireNamespace("boot", quietly = TRUE)) {
+  stop("The boot package is required.")
+}
+
+# ==============================================================================
+# Select the best eligible pairs for the currently selected predictor
+# ==============================================================================
+
+top_k <- 30L
+number_bootstrap_samples <- 1000L
+bootstrap_seed <- 5515L
+
+if (
+  length(output) != nrow(pairs) ||
+  length(RMSE) != nrow(pairs) ||
+  length(MAE) != nrow(pairs) ||
+  length(coverage) != nrow(pairs)
+) {
+  stop("Reload the financial results for one predictor before bootstrapping.")
+}
+
+eligible_ids <- which(
+  is.finite(RMSE) &
+    is.finite(MAE) &
+    !is.na(coverage) &
+    coverage == 1
+)
+
+eligible_ids <- eligible_ids[order(RMSE[eligible_ids])]
+
+bootstrap_model_ids <- head(eligible_ids, top_k)
+number_models <- length(bootstrap_model_ids)
+
+if (!number_models) {
+  stop("No eligible proxy spaces are available for bootstrapping.")
+}
+
+if (
+  is.null(covariate_names) ||
+  length(covariate_names) < max(c(pairs$i, pairs$j))
+) {
+  stop("The saved covariate names are missing or inconsistent with pairs.")
+}
+
+model_names <- paste0(
+  covariate_names[pairs$i[bootstrap_model_ids]],
+  "__",
+  covariate_names[pairs$j[bootstrap_model_ids]]
+)
+
+# ==============================================================================
+# Daily prediction losses, averaged over all firms
+# ==============================================================================
+
+logreturns <- as.matrix(logreturns)
+
+if (
+  !is.numeric(logreturns) ||
+  any(!is.finite(logreturns)) ||
+  nrow(logreturns) < 4L ||
+  ncol(logreturns) < 1L
+) {
+  stop("Supply finite logreturns in the original time and firm order.")
+}
+
+observed_volatility <- abs(logreturns[-1L, , drop = FALSE])
+
+T_eval <- nrow(observed_volatility)
+n_eval <- ncol(observed_volatility)
+
+# With complete, equally weighted data:
+# RMSE = sqrt(mean(daily cross-sectional mean squared error)).
+#
+# All firms remain together at each date. Only a time x selected-model
+# loss matrix is needed; no full prediction array is constructed.
+
+loss_by_time <- vapply(
+  bootstrap_model_ids,
+  function(model_id) {
+    h <- output[[model_id]]$sigma2_pred_S2
+
+    if (
+      !is.matrix(h) ||
+      !is.numeric(h) ||
+      !identical(dim(h), dim(logreturns)) ||
+      any(!is.finite(h)) ||
+      any(h <= 0)
+    ) {
+      stop(
+        "Invalid conditional-variance predictions for model ",
+        model_id, "."
+      )
+    }
+
+    if (
+      (
+        !is.null(colnames(h)) &&
+        !is.null(colnames(logreturns)) &&
+        !identical(colnames(h), colnames(logreturns))
+      ) ||
+      (
+        !is.null(rownames(h)) &&
+        !is.null(rownames(logreturns)) &&
+        !identical(rownames(h), rownames(logreturns))
+      )
+    ) {
+      stop(
+        "Prediction and observation ordering differs for model ",
+        model_id, "."
+      )
+    }
+
+    rowMeans(
+      (
+        sqrt(h[-1L, , drop = FALSE]) -
+          observed_volatility
+      )^2
+    )
+  },
+  numeric(T_eval)
+)
+
+colnames(loss_by_time) <- model_names
+
+if (any(!is.finite(loss_by_time))) {
+  stop("Nonfinite prediction losses.")
+}
+
+original_rmse <- sqrt(colMeans(loss_by_time))
+
+if (!isTRUE(all.equal(
+  unname(original_rmse),
+  unname(RMSE[bootstrap_model_ids]),
+  tolerance = 1e-8
+))) {
+  stop(
+    "Recomputed scores differ from the saved RMSE values. ",
+    "Check the predictor, data ordering, and whether the saved ",
+    "scores used sigma2_pred_S2."
+  )
+}
+
+# ==============================================================================
+# Paired stationary bootstrap over time
+# ==============================================================================
+
+# Starting heuristic for the mean random block length, in observation days.
+# Check sensitivity to shorter and longer blocks before interpreting intervals.
+mean_block_length <- as.integer(ceiling(T_eval^(1 / 3)))
+
+set.seed(bootstrap_seed)
+
+bootstrap_fit <- boot::tsboot(
+  tseries = loss_by_time,
+  statistic = function(x) {
+    # Preserve a matrix even when only one model is selected.
+    sqrt(colMeans(matrix(x, ncol = number_models)))
+  },
+  R = number_bootstrap_samples,
+  l = mean_block_length,
+  sim = "geom",
+  parallel = "no"
+)
+
+# One multivariate call uses the same sampled time blocks for every model.
+rmse_bootstrap <- bootstrap_fit$t
+colnames(rmse_bootstrap) <- model_names
+
+bootstrap_quantiles <- t(
+  apply(
+    rmse_bootstrap,
+    2L,
+    stats::quantile,
+    probs = c(0.025, 0.975),
+    names = FALSE
+  )
+)
+
+bootstrap_summary <- data.frame(
+  model_id = bootstrap_model_ids,
+  variable_1 = covariate_names[pairs$i[bootstrap_model_ids]],
+  variable_2 = covariate_names[pairs$j[bootstrap_model_ids]],
+  predictor = predictor,
+  RMSE = unname(original_rmse),
+  bootstrap_SE = apply(rmse_bootstrap, 2L, stats::sd),
+  lower_95 = bootstrap_quantiles[, 1L],
+  upper_95 = bootstrap_quantiles[, 2L],
+  row.names = NULL
+)
+
+# Pointwise percentile intervals for fixed-prediction scores.
+# These exclude uncertainty from refitting, changing folds, selecting the
+# best pairs, and sampling different firms. They are not simultaneous intervals.
+# Interpretation requires approximately stationary, weakly dependent daily
+# losses with adequate moments.
+
+bootstrap_settings <- list(
+  predictor = predictor,
+  scheme = "paired stationary time-block bootstrap of daily panel losses",
+  number_bootstrap_samples = number_bootstrap_samples,
+  mean_block_length = mean_block_length,
+  seed = bootstrap_seed,
+  number_models = number_models,
+  T_eval = T_eval,
+  n_eval = n_eval,
+  score = "sqrt(sigma2_pred_S2) versus abs(logreturns), excluding row 1",
+  refitted = FALSE,
+  selection_adjusted = FALSE
+)
+
+dir.create(
+  "Finance_example",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+save(
+  rmse_bootstrap,
+  bootstrap_model_ids,
+  bootstrap_summary,
+  bootstrap_settings,
+  file = file.path(
+    "Finance_example",
+    "bootstrap_rmse_results.rda"
+  )
+)
+
+# Column j corresponds to bootstrap_model_ids[j], not necessarily model j.
+# This file contains the bootstrap for the currently selected predictor only.
+```
+
+Load the pre-computed bootstrap results.
+
+```{r}
+#| label: load-proxy-space-bootstrap
+#| message: false
+#| warning: false
+
+bootstrap_file <- file.path(
+  "Finance_example",
+  "bootstrap_rmse_results.rda"
+)
+
+if (!file.exists(bootstrap_file)) {
+  stop(
+    "The pre-computed bootstrap file was not found at: ",
+    bootstrap_file
+  )
+}
+
+bootstrap_objects <- load(bootstrap_file)
+
+if (!"rmse_bootstrap" %in% bootstrap_objects) {
+  stop(
+    "The bootstrap file does not contain `rmse_bootstrap`."
+  )
+}
+```
+
+### Cross-validation performance
+
+Figure 5 shows the sorted cross-validation RMSE values and bootstrap uncertainty intervals for the 30 best-performing proxy spaces.
+
+```{r}
+#| label: fig-cross-validation-rmse
+#| fig-width: 7
+#| fig-height: 9
+#| fig-cap: "Cross-validation RMSE across eligible proxy spaces (upper panel) and pointwise 95% stationary-bootstrap intervals for up to 30 best-performing spaces (lower panel). Points show original CV-RMSE values. Intervals hold predictions fixed and do not adjust for proxy-space selection."
+#| message: false
+#| warning: false
+
+# ==============================================================================
+# Rank eligible proxy spaces for the currently selected predictor
+# ==============================================================================
+
+top_k <- 30L
+
+eligible_ids <- which(
+  is.finite(RMSE) &
+    is.finite(MAE) &
+    !is.na(coverage) &
+    coverage == 1
+)
+
+eligible_ids <- eligible_ids[order(RMSE[eligible_ids])]
+
+if (!length(eligible_ids)) {
+  stop("No eligible proxy spaces are available for this figure.")
+}
+
+top_ids <- head(eligible_ids, top_k)
+top_original_rmse <- RMSE[top_ids]
+proxy_rank <- seq_along(top_ids)
+sorted_rmse <- RMSE[eligible_ids]
+
+# ==============================================================================
+# Load the pre-computed bootstrap without overwriting the CV objects
+# ==============================================================================
+
+bootstrap_file <- file.path(
+  "Finance_example",
+  "bootstrap_rmse_results.rda"
+)
+
+if (!file.exists(bootstrap_file)) {
+  stop("The pre-computed bootstrap results were not found: ", bootstrap_file)
+}
+
+bootstrap_data <- new.env(parent = emptyenv())
+load(bootstrap_file, envir = bootstrap_data)
+
+required_objects <- c(
+  "bootstrap_model_ids",
+  "bootstrap_summary",
+  "bootstrap_settings"
+)
+
+if (!all(required_objects %in% ls(bootstrap_data))) {
+  stop(
+    "The bootstrap file has the old structure. ",
+    "Run the updated compute-proxy-space-bootstrap chunk manually."
+  )
+}
+
+bootstrap_settings <- bootstrap_data$bootstrap_settings
+bootstrap_summary <- bootstrap_data$bootstrap_summary
+bootstrap_model_ids <- bootstrap_data$bootstrap_model_ids
+
+if (!identical(bootstrap_settings$predictor, predictor)) {
+  stop(
+    "The bootstrap file contains results for ",
+    bootstrap_settings$predictor,
+    ", but the selected predictor is ",
+    predictor,
+    ". Load or compute the matching bootstrap."
+  )
+}
+
+if (
+  anyDuplicated(bootstrap_summary$model_id) ||
+  !setequal(top_ids, bootstrap_model_ids)
+) {
+  stop(
+    "The bootstrapped model IDs do not match the current best eligible pairs. ",
+    "Regenerate the bootstrap for the current CV results."
+  )
+}
+
+# Match by original model ID, not by bootstrap column position.
+bootstrap_rows <- match(
+  top_ids,
+  bootstrap_summary$model_id
+)
+
+if (anyNA(bootstrap_rows)) {
+  stop("Bootstrap summaries are missing for one or more selected models.")
+}
+
+top_bootstrap <- bootstrap_summary[
+  bootstrap_rows,
+  ,
+  drop = FALSE
+]
+
+if (!isTRUE(all.equal(
+  unname(top_bootstrap$RMSE),
+  unname(top_original_rmse),
+  tolerance = 1e-8
+))) {
+  stop(
+    "The bootstrap and current CV scores differ. ",
+    "Check that both files come from the same analysis."
+  )
+}
+
+bootstrap_lower <- top_bootstrap$lower_95
+bootstrap_upper <- top_bootstrap$upper_95
+
+if (
+  any(!is.finite(c(bootstrap_lower, bootstrap_upper))) ||
+  any(bootstrap_lower < 0) ||
+  any(bootstrap_upper < bootstrap_lower)
+) {
+  stop("Invalid bootstrap interval bounds.")
+}
+
+method_label <- switch(
+  predictor,
+  xi_blp = "Squared-innovation BLP",
+  eta_gaussian = "Gaussian conditional-moment predictor"
+)
+
+# ==============================================================================
+# Plot both panels and restore graphical settings
+# ==============================================================================
+
+local({
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+
+  par(
+    mfrow = c(2, 1),
+    mar = c(4.5, 4.5, 3, 1)
+  )
+
+  # Panel (a): all eligible proxy spaces.
+  
+  # pdf("rmse.pdf", width = 7, height = 5)
+
+  plot(
+    seq_along(sorted_rmse),
+    sorted_rmse,
+    type = "p",
+    pch = 20,
+    xlab = "Rank of eligible proxy space",
+    ylab = "CV-RMSE",
+    main = paste("(a)", method_label)
+  )
+
+  points(
+    x = 1,
+    y = sorted_rmse[1],
+    pch = 19,
+    cex = 1.2
+  )
+
+  legend(
+    "topleft",
+    legend = sprintf("Minimum RMSE = %.5f", sorted_rmse[1]),
+    bty = "n",
+    cex = 0.85
+  )
+  
+  # dev.off()
+  
+  
+  # Panel (b): original scores and pointwise bootstrap intervals.
+  
+  # pdf("bootstrap_rmse.pdf", 7, 5)
+  
+  plot(
+    proxy_rank,
+    top_original_rmse,
+    type = "n",
+    ylim = range(
+      c(
+        bootstrap_lower,
+        bootstrap_upper,
+        top_original_rmse
+      )
+    ),
+    xlab = "Proxy space rank by original CV-RMSE",
+    ylab = "CV-RMSE",
+    main = paste0(
+      "(b) Bootstrap intervals: top ",
+      length(top_ids),
+      " spaces"
+    )
+  )
+
+  # Avoid zero-length arrows for degenerate intervals.
+  nonzero_interval <- bootstrap_upper > bootstrap_lower
+
+  if (any(nonzero_interval)) {
+    arrows(
+      x0 = proxy_rank[nonzero_interval],
+      y0 = bootstrap_lower[nonzero_interval],
+      x1 = proxy_rank[nonzero_interval],
+      y1 = bootstrap_upper[nonzero_interval],
+      angle = 90,
+      code = 3,
+      length = 0.03,
+      lwd = 1,
+      col = "grey45"
+    )
+  }
+
+  points(
+    proxy_rank,
+    top_original_rmse,
+    pch = 16,
+    cex = 1
+  )
+
+  legend(
+    "topleft",
+    legend = c(
+      "Original CV-RMSE",
+      "95% pointwise bootstrap interval"
+    ),
+    pch = c(16, NA),
+    lty = c(NA, 1),
+    col = c("black", "grey45"),
+    bty = "n",
+    cex = 0.85
+  )
+  
+  # dev.off()
+  
+})
+```
+
+### Predicted volatility in the best proxy space
+
+Figure 6 uses the best-performing proxy space.
+
+```{r}
+#| label: fig-predicted-financial-volatility
+#| fig-width: 12
+#| fig-height: 5
+#| fig-cap: "Cross-validated conditional volatility in the best-performing financial proxy space for the selected predictor. Left: firm-level predictions (gray) and their cross-sectional median (black). Right: color indicates median predicted volatility; point size encodes its temporal standard deviation."
+#| message: false
+#| warning: false
+
+# ==============================================================================
+# Select the best eligible proxy space
+# ==============================================================================
+
+eligible_ids <- which(
+  is.finite(RMSE) &
+    is.finite(MAE) &
+    !is.na(coverage) &
+    coverage == 1
+)
+
+if (!length(eligible_ids)) {
+  stop("No eligible proxy spaces are available for this figure.")
+}
+
+best_pair <- 781 # eligible_ids[which.min(RMSE[eligible_ids])]
+
+best_variables <- covariate_names[
+  c(
+    as.integer(pairs$i[best_pair]),
+    as.integer(pairs$j[best_pair])
+  )
+]
+
+# ==============================================================================
+# Conditional variance -> conditional standard deviation (volatility)
+# ==============================================================================
+
+predicted_variance_full <- output[[best_pair]]$sigma2_pred_S2
+
+if (
+  !is.matrix(predicted_variance_full) ||
+  !is.numeric(predicted_variance_full) ||
+  nrow(predicted_variance_full) < 3L ||
+  any(!is.finite(predicted_variance_full)) ||
+  any(predicted_variance_full <= 0)
+) {
+  stop("The selected model has no valid conditional-variance predictions.")
+}
+
+# Exclude initialization row 1, then take the square root.
+predicted_variance_best <- predicted_variance_full[
+  -1L,
+  ,
+  drop = FALSE
+]
+
+predicted_volatility <- sqrt(predicted_variance_best)
+
+# ==============================================================================
+# Align dates with the predictions
+# ==============================================================================
+
+dates_for_plot <- if (is.character(Dates)) {
+  as.Date(Dates)
+} else {
+  Dates
+}
+
+if (length(dates_for_plot) == nrow(predicted_variance_full)) {
+  # Dates already correspond to returns.
+  return_dates <- dates_for_plot
+} else if (
+  length(dates_for_plot) == nrow(predicted_variance_full) + 1L
+) {
+  # Dates correspond to prices: differencing removes the first price date.
+  return_dates <- dates_for_plot[-1L]
+} else {
+  stop(
+    "Dates must contain one date per return, ",
+    "or one extra initial price date."
+  )
+}
+
+# Remove the date corresponding to initialization row 1.
+time_vec <- return_dates[-1L]
+
+if (
+  length(time_vec) != nrow(predicted_volatility) ||
+  anyNA(time_vec) ||
+  is.unsorted(time_vec, strictly = TRUE)
+) {
+  stop("Check the date alignment and chronological ordering of predictions.")
+}
+
+# Cross-sectional median at each date.
+median_vol <- apply(
+  predicted_volatility,
+  1L,
+  stats::median
+)
+
+# Firm-specific summaries across time.
+pred_vola_median <- apply(
+  predicted_volatility,
+  2L,
+  stats::median
+)
+
+pred_vola_sd <- apply(
+  predicted_volatility,
+  2L,
+  stats::sd
+)
+
+# ==============================================================================
+# Coordinates in the selected proxy space
+# ==============================================================================
+
+if (
+  length(best_variables) != 2L ||
+  anyNA(best_variables) ||
+  is.null(colnames(A_stand)) ||
+  !all(best_variables %in% colnames(A_stand))
+) {
+  stop("A_stand must contain the saved variables defining the best proxy space.")
+}
+
+coords_best <- as.matrix(
+  A_stand[, best_variables, drop = FALSE]
+)
+
+firm_names <- colnames(predicted_variance_full)
+
+# Align firms explicitly when common identifiers are available.
+# Otherwise A_stand must retain its original CV firm order.
+if (
+  !is.null(firm_names) &&
+  !is.null(rownames(coords_best)) &&
+  !anyDuplicated(firm_names) &&
+  !anyDuplicated(rownames(coords_best)) &&
+  setequal(firm_names, rownames(coords_best))
+) {
+  coords_best <- coords_best[firm_names, , drop = FALSE]
+}
+
+if (
+  !is.numeric(coords_best) ||
+  any(!is.finite(coords_best)) ||
+  nrow(coords_best) != ncol(predicted_volatility)
+) {
+  stop("The firm coordinates and volatility predictions are incompatible.")
+}
+
+# ==============================================================================
+# Colors and point sizes
+# ==============================================================================
+
+col_fun <- grDevices::colorRampPalette(
+  c("steelblue", "grey", "darkred")
+)
+
+# Remove duplicate quantile boundaries when summaries are tied.
+vola_breaks <- unique(
+  as.numeric(
+    stats::quantile(
+      pred_vola_median,
+      probs = seq(0, 1, length.out = 8L)
+    )
+  )
+)
+
+if (length(vola_breaks) > 1L) {
+  vola_groups <- cut(
+    pred_vola_median,
+    breaks = vola_breaks,
+    include.lowest = TRUE,
+    dig.lab = 5
+  )
+
+  vola_bins <- as.integer(vola_groups)
+  legend_labels <- levels(vola_groups)
+  cols <- col_fun(length(legend_labels))
+} else {
+  vola_bins <- rep(1L, length(pred_vola_median))
+  legend_labels <- format(signif(vola_breaks, 5))
+  cols <- col_fun(3L)[2L]
+}
+
+sd_range <- range(pred_vola_sd)
+
+if (diff(sd_range) > 0) {
+  scaled_cex <- sqrt(
+    0.5 +
+      1.5 * (pred_vola_sd - sd_range[1L]) / diff(sd_range)
+  )
+} else {
+  scaled_cex <- rep(1, length(pred_vola_sd))
+}
+
+# ==============================================================================
+# Joint figure
+# ==============================================================================
+
+local({
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+
+  par(
+    mfrow = c(1, 2),
+    mar = c(4.5, 4.5, 3, 1)
+  )
+
+  # Conditional volatility over time.
+  
+  # pdf("Pred_vola_time.pdf", width = 7, height = 5)
+  
+  plot(
+    time_vec,
+    median_vol,
+    type = "n",
+    ylim = range(predicted_volatility),
+    xlab = "Time",
+    ylab = "Predicted volatility (log-return units)",
+    main = "Predicted conditional volatility"
+  )
+
+  matlines(
+    time_vec,
+    predicted_volatility,
+    col = "lightgrey",
+    lty = 1,
+    lwd = 0.8
+  )
+
+  lines(
+    time_vec,
+    median_vol,
+    col = "black",
+    lwd = 2
+  )
+  
+  # dev.off()
+  
+  # Firm-level volatility summaries in the proxy space.
+  
+  # pdf("pred_vola_space.pdf", height = 5, width = 5)
+  
+  plot(
+    coords_best[, 1L],
+    coords_best[, 2L],
+    col = "grey35",
+    bg = cols[vola_bins],
+    pch = 21,
+    cex = scaled_cex,
+    lwd = 0.5,
+    xlab = best_variables[1L],
+    ylab = best_variables[2L],
+    main = "Median predicted volatility"
+  )
+
+  legend(
+    "topright",
+    legend = legend_labels,
+    pt.bg = cols,
+    col = "grey35",
+    pch = 21,
+    pt.cex = 1.2,
+    cex = 0.75,
+    title = "Median volatility",
+    bty = "n"
+  )
+  
+  # dev.off()
+  
+})
+```
+
+### Full estimation in the interpretable proxy space
+
+
+```{r}
+#| label: compute-selected-financial-model
+#| eval: false
+#| code-fold: true
+#| code-summary: "Show full financial estimation and parameter-surface computation"
+#| message: true
+#| warning: true
+
+source("stgarch_spatial_estimation_parallelCV.R")
+
+# ==============================================================================
+# Reuse the financial CV bounds and starting values
+# ==============================================================================
+
+financial_results_file <- file.path(
+  "Finance_example", "financial_proxy_space_CV_results.rds"
+)
+
+if (!file.exists(financial_results_file)) {
+  stop("The financial CV results were not found: ", financial_results_file)
+}
+
+financial_fit_settings <- readRDS(financial_results_file)$settings
+required_settings <- c("theta_init", "lower", "upper", "stationarity_margin")
+
+if (!all(required_settings %in% names(financial_fit_settings))) {
+  stop("The saved financial CV settings are incomplete. Regenerate the updated CV results.")
+}
+
+if (!identical(financial_fit_settings$kernel, "separable Gaussian")) {
+  warning(
+    "The saved CV metadata does not report a separable Gaussian kernel. ",
+    "This full fit uses Gaussian weights; verify the CV kernel before comparing results."
+  )
+}
+
+# ==============================================================================
+# Explicitly selected financial proxy space
+# ==============================================================================
+
+# Retain the pair specified for the detailed analysis. This does not
+# automatically select the best pair or use selected_id from another chunk.
+selected_space_variables <- c("netIncome", "incomeTaxExpense")
+ 
+logreturns <- as.matrix(logreturns)
+A_stand <- as.matrix(A_stand)
+
+if (is.null(colnames(A_stand)) ||
+    !all(selected_space_variables %in% colnames(A_stand))) {
+  stop("A_stand must contain: ", paste(selected_space_variables, collapse = ", "))
+}
+
+# Rows of A_stand must retain the firm order of the columns of logreturns.
+coords_opt <- A_stand[, selected_space_variables, drop = FALSE]
+
+if (nrow(coords_opt) != ncol(logreturns)) {
+  stop("The firm coordinates and log-return columns have incompatible dimensions.")
+}
+
+local_fit_arguments <- list(
+  Z = logreturns,
+  coords = coords_opt,
+  theta_init = financial_fit_settings$theta_init,
+  lower = financial_fit_settings$lower,
+  upper = financial_fit_settings$upper,
+  stationarity_margin = financial_fit_settings$stationarity_margin,
+  weight_function = a2d_sepgauss,
+  bandwidth_function = default_bandwidth,
+  parallel = TRUE,
+  n_workers = 5L,
+  progress = TRUE
+)
+
+# ==============================================================================
+# Local GARCH estimation at all observed firms
+# ==============================================================================
+
+observed_parameter_fit <- do.call(
+  fit_stgarch_local_parameters,
+  c(local_fit_arguments, list(target_coords = coords_opt))
+)
+
+output_optimum_full <- observed_parameter_fit$estimated_params
+b <- observed_parameter_fit$bandwidth
+
+# Estimation failures stop inside the fitting function; failed fits are not
+# replaced by zeros or accepted through an unchecked optimizer return code.
+
+# ==============================================================================
+# Fitted conditional variances and standardized innovations
+# ==============================================================================
+
+inv_return <- stgarch_invert(
+  Z = logreturns,
+  parameters = output_optimum_full
+)
+
+sigma2_fit <- inv_return$sigma2
+volatility_fit <- sqrt(sigma2_fit)
+eta_S1_hat <- inv_return$eta
+xi_S1_hat <- inv_return$xi
+zeta_S1_hat <- sigma2_fit * xi_S1_hat
+
+# These are full-data fitted quantities, not cross-validated predictions.
+# Row 1 initializes the filter and should be excluded from plots and scoring.
+
+# ==============================================================================
+# Innovation covariance: same estimation helper as in the corrected CV code
+# ==============================================================================
+
+D_train <- as.matrix(stats::dist(coords_opt))
+
+par_eta_hat <- .stgarch_covariance(
+  eta = eta_S1_hat[-1L, , drop = FALSE],
+  D = D_train
+)
+
+covariance_estimates <- c(
+  theta = par_eta_hat$range,
+  sigma2 = par_eta_hat$spatial_variance,
+  tau2 = par_eta_hat$nugget_variance
+)
+
+# sigma2 and tau2 are the normalized covariance components: their sum is 1.
+# par_eta_hat$raw_total_variance records the pre-normalization nuisance scale.
+# par_eta_hat is no longer a solnp object. No Hessian-based standard errors or
+# z-statistics are calculated: this helper supplies point estimates only.
+
+# ==============================================================================
+# Local parameter surfaces on the regular grid
+# ==============================================================================
+
+grid_size <- 75L
+x_vals <- seq(min(coords_opt[, 1]), max(coords_opt[, 1]), length.out = grid_size)
+y_vals <- seq(min(coords_opt[, 2]), max(coords_opt[, 2]), length.out = grid_size)
+
+grid <- expand.grid(x = x_vals, y = y_vals)
+S0 <- as.matrix(grid)
+n0 <- nrow(S0)
+
+surface_bandwidth <- 0.65 # observed_parameter_fit$bandwidth
+
+grid_parameter_fit <- do.call(
+  fit_stgarch_local_parameters,
+  c(
+    local_fit_arguments,
+    list(target_coords = S0, bandwidth = surface_bandwidth)
+  )
+)
+
+estimated_params_S0 <- grid_parameter_fit$estimated_params
+param_names <- c("omega", "alpha", "beta")
+
+plot_data <- cbind(
+  grid,
+  as.data.frame(estimated_params_S0[, param_names, drop = FALSE])
+)
+
+coords_df <- data.frame(x = coords_opt[, 1], y = coords_opt[, 2])
+
+# Gaussian weights allow fitting throughout the bounding rectangle, but estimates
+# far from observed firms can be weakly supported. This grid is not an assertion
+# of uniformly reliable interpolation over its entire extent.
+
+# ==============================================================================
+# Save the full-data estimates and plotting objects
+# ==============================================================================
+
+full_fit_settings <- list(
+  theta_init = local_fit_arguments$theta_init,
+  lower = local_fit_arguments$lower,
+  upper = local_fit_arguments$upper,
+  stationarity_margin = local_fit_arguments$stationarity_margin,
+  kernel = "separable Gaussian",
+  bandwidth_rule = "default_bandwidth",
+  observed_bandwidth = b,
+  surface_bandwidth = surface_bandwidth,
+  grid_size = grid_size,
+  covariance_normalization = "C_eta(0) = 1"
+)
+
+dir.create("Finance_example", recursive = TRUE, showWarnings = FALSE)
+
+save(
+  selected_space_variables,
+  coords_opt,
+  b,
+  output_optimum_full,
+  sigma2_fit,
+  volatility_fit,
+  eta_S1_hat,
+  xi_S1_hat,
+  zeta_S1_hat,
+  D_train,
+  par_eta_hat,
+  covariance_estimates,
+  grid,
+  S0,
+  estimated_params_S0,
+  param_names,
+  plot_data,
+  coords_df,
+  surface_bandwidth,
+  full_fit_settings,
+  file = file.path("Finance_example", "selected_proxy_space_results.rda")
+)
+```
+
+
+The pre-computed estimates are loaded.
+
+```{r}
+#| label: load-selected-financial-model1
+#| message: false
+#| warning: false
+
+results_file <- file.path(
+  "Finance_example",
+  "selected_proxy_space_results.rda"
+)
+
+if (!file.exists(results_file)) {
+  stop(
+    "The pre-computed results file was not found at: ",
+    results_file
+  )
+}
+
+# Load separately so an outdated file cannot partially overwrite current objects.
+results_env <- new.env(parent = emptyenv())
+
+loaded_objects <- load(
+  results_file,
+  envir = results_env
+)
+
+required_objects <- c(
+  "selected_space_variables",
+  "coords_opt",
+  "b",
+  "output_optimum_full",
+  "sigma2_fit",
+  "volatility_fit",
+  "eta_S1_hat",
+  "xi_S1_hat",
+  "zeta_S1_hat",
+  "D_train",
+  "par_eta_hat",
+  "covariance_estimates",
+  "grid",
+  "S0",
+  "estimated_params_S0",
+  "param_names",
+  "plot_data",
+  "coords_df",
+  "surface_bandwidth",
+  "full_fit_settings"
+)
+
+missing_objects <- setdiff(
+  required_objects,
+  loaded_objects
+)
+
+if (length(missing_objects) > 0L) {
+  stop(
+    "The results file is missing: ",
+    paste(missing_objects, collapse = ", "),
+    ". Run the revised compute-selected-financial-model chunk ",
+    "manually to regenerate it."
+  )
+}
+
+# Export only the expected objects from the validated results file.
+invisible(
+  list2env(
+    mget(
+      required_objects,
+      envir = results_env,
+      inherits = FALSE
+    ),
+    envir = environment()
+  )
+)
+
+message(
+  "Loaded the full-model results for: ",
+  paste(selected_space_variables, collapse = " and "),
+  "."
+)
+
+# Fitted volatility: volatility_fit = sqrt(sigma2_fit).
+# Exclude initialization row 1 when plotting.
+#
+# covariance_standard_errors and covariance_z_statistics are no longer supplied;
+# remove references to them from subsequent chunks.
+```
+
+
+### Estimated innovation covariance
+
+The following table reports the estimated range, spatial variance and nugget variance, together with approximate standard errors and $z$-statistics. The observed correlation range is evaluated over the pairwise distances between firms.
+
+
+```{r}
+#| label: selected-space-covariance-results1
+#| message: false
+#| warning: false
+
+# ==============================================================================
+# Estimated innovation covariance parameters
+# ==============================================================================
+
+theta_hat <- par_eta_hat$range
+sigma2_hat <- par_eta_hat$spatial_variance
+tau2_hat <- par_eta_hat$nugget_variance
+
+stopifnot(
+  length(theta_hat) == 1L,
+  length(sigma2_hat) == 1L,
+  length(tau2_hat) == 1L,
+  all(is.finite(c(theta_hat, sigma2_hat, tau2_hat))),
+  theta_hat > 0,
+  sigma2_hat >= 0,
+  tau2_hat >= 0,
+  abs(sigma2_hat + tau2_hat - 1) < 1e-8
+)
+
+covariance_table <- data.frame(
+  parameter = c(
+    "theta",
+    "sigma2",
+    "tau2"
+  ),
+  description = c(
+    "Exponential range parameter",
+    "Spatial variance component (normalized)",
+    "Nugget variance component (normalized)"
+  ),
+  estimate = c(
+    theta_hat,
+    sigma2_hat,
+    tau2_hat
+  )
+)
+
+knitr::kable(
+  covariance_table,
+  digits = 4,
+  caption = paste(
+    "Estimated standardized-innovation covariance parameters",
+    "(sigma2 + tau2 = 1)."
+  )
+)
+
+# ==============================================================================
+# Dependence over the observed financial distances
+# ==============================================================================
+
+stopifnot(
+  nrow(coords_opt) >= 2L,
+  ncol(coords_opt) >= 2L,
+  all(is.finite(as.matrix(coords_opt[, 1:2, drop = FALSE])))
+)
+
+# Distances between distinct firms in the selected proxy space.
+observed_distances <- as.numeric(
+  stats::dist(coords_opt[, 1:2, drop = FALSE])
+)
+
+# Correlations between distinct firms under the fitted model.
+# The nugget contributes to marginal variance, not cross-covariance.
+observed_correlations <-
+  sigma2_hat * exp(-observed_distances / theta_hat) /
+  (sigma2_hat + tau2_hat)
+
+spatial_dependence_summary <- data.frame(
+  quantity = c(
+    "Maximum observed distance",
+    "Minimum fitted correlation between firms",
+    "Maximum fitted correlation between firms"
+  ),
+  value = c(
+    max(observed_distances),
+    min(observed_correlations),
+    max(observed_correlations)
+  )
+)
+
+knitr::kable(
+  spatial_dependence_summary,
+  digits = 4,
+  caption = paste(
+    "Pairwise distances and fitted standardized-innovation",
+    "correlations in the selected financial proxy space."
+  )
+)
+```
+
+### Estimated GARCH parameter surfaces
+
+The parameter surfaces are evaluated on a regular $75\times75$ grid. For the visualisation, estimates are retained only inside the convex hull of the observed firms and where the distance to the nearest firm is not unusually large.
+
+```{r}
+#| label: fig-financial-parameter-surfaces
+#| layout-ncol: 3
+#| fig-width: 5
+#| fig-height: 5
+#| fig-cap: "Estimated GARCH parameter surfaces in the selected financial proxy space. Surfaces are masked outside the observed convex hull and in regions with large nearest-firm distances; points indicate firms."
+#| message: false
+#| warning: false
+
+library(ggplot2)
+
+# ==============================================================================
+# Prepare the parameter-surface data
+# ==============================================================================
+
+param_names <- c("omega", "alpha", "beta")
+
+grid_coordinates <- as.matrix(grid)
+parameter_estimates <- as.matrix(estimated_params_S0)
+firm_coordinates <- as.matrix(coords_opt)
+
+stopifnot(
+  ncol(grid_coordinates) == 2L,
+  ncol(firm_coordinates) == 2L,
+  nrow(grid_coordinates) == nrow(parameter_estimates),
+  all(param_names %in% colnames(parameter_estimates)),
+  all(is.finite(grid_coordinates)),
+  all(is.finite(firm_coordinates))
+)
+
+parameter_estimates <- parameter_estimates[
+  ,
+  param_names,
+  drop = FALSE
+]
+
+stopifnot(
+  all(is.finite(parameter_estimates)),
+  !anyDuplicated(as.data.frame(grid_coordinates))
+)
+
+# Preserve the grid order used during estimation.
+plot_data <- data.frame(
+  x = grid_coordinates[, 1],
+  y = grid_coordinates[, 2],
+  parameter_estimates,
+  check.names = FALSE
+)
+
+coords_df <- data.frame(
+  x = firm_coordinates[, 1],
+  y = firm_coordinates[, 2]
+)
+
+axis_labels <- colnames(coords_opt)
+
+if (is.null(axis_labels) || any(!nzchar(axis_labels))) {
+  axis_labels <- selected_space_variables
+}
+
+# ==============================================================================
+# Mask regions with limited spatial support
+# ==============================================================================
+
+hull_indices <- grDevices::chull(coords_df$x, coords_df$y)
+
+if (length(hull_indices) < 3L) {
+  stop("The observed firm locations do not define a two-dimensional convex hull.")
+}
+
+coords_hull <- coords_df[hull_indices, , drop = FALSE]
+coords_hull <- rbind(coords_hull, coords_hull[1, , drop = FALSE])
+
+nearest_distance <- as.numeric(
+  FNN::get.knnx(
+    data = as.matrix(coords_df),
+    query = as.matrix(plot_data[, c("x", "y")]),
+    k = 1
+  )$nn.dist[, 1]
+)
+
+inside_hull <- sp::point.in.polygon(
+  point.x = plot_data$x,
+  point.y = plot_data$y,
+  pol.x = coords_hull$x,
+  pol.y = coords_hull$y
+) > 0
+
+# Retain the existing distance-based plotting heuristic.
+distance_threshold <- grDevices::boxplot.stats(
+  nearest_distance
+)$stats[5]
+
+plot_data$use <-
+  inside_hull &
+  is.finite(nearest_distance) &
+  nearest_distance <= distance_threshold
+
+if (!any(plot_data$use)) {
+  stop("No grid points remain after applying the spatial plotting mask.")
+}
+
+for (param in param_names) {
+  plot_data[[paste0(param, "_masked")]] <- ifelse(
+    plot_data$use,
+    plot_data[[param]],
+    NA_real_
+  )
+}
+
+# ==============================================================================
+# Construct and save the parameter-surface plots
+# ==============================================================================
+
+col_vals <- grDevices::colorRampPalette(
+  c("steelblue", "grey", "darkred")
+)(100)
+
+# Display the parameters in the order used in the paper.
+for (param in c("beta", "alpha", "omega")) {
+
+  # Use one explicit plotting column for each panel.
+  panel_data <- plot_data
+  panel_data$fill_value <- panel_data[[paste0(param, "_masked")]]
+
+  gg <- ggplot(
+    panel_data,
+    aes(x = x, y = y)
+  ) +
+    geom_raster(
+      aes(fill = fill_value),
+      na.rm = TRUE
+    )
+
+  # Constant surfaces do not have meaningful contour levels.
+  finite_values <- panel_data$fill_value[
+    is.finite(panel_data$fill_value)
+  ]
+
+  if (length(unique(finite_values)) > 1L) {
+    gg <- gg +
+      geom_contour(
+        aes(z = fill_value),
+        colour = "black",
+        linewidth = 0.3,
+        bins = 10,
+        na.rm = TRUE
+      )
+  }
+
+  gg <- gg +
+    geom_point(
+      data = coords_df,
+      aes(x = x, y = y),
+      colour = "black",
+      fill = "white",
+      shape = 21,
+      size = 2,
+      stroke = 0.3,
+      inherit.aes = FALSE
+    ) +
+    scale_fill_gradientn(
+      colours = col_vals,
+      na.value = "transparent",
+      name = param
+    ) +
+    coord_fixed() +
+    labs(
+      title = paste("Estimated", param),
+      x = axis_labels[1],
+      y = axis_labels[2]
+    ) +
+    theme_minimal()
+
+  print(gg)
+
+  ggsave(
+    filename = paste0("surface_", param, ".pdf"),
+    plot = gg,
+    width = 5,
+    height = 5,
+    units = "in"
+  )
+}
+```
+
+## PM10 residual volatility in Italy
+
+The second empirical application analyses the residuals from a fitted spatiotemporal PM$_{10}$ mean model. Residual volatility is interpreted as time-varying model uncertainty after the systematic mean structure has been removed.
+
+Stations with more than 20% missing residuals are excluded. The remaining missing values are imputed by centred Gaussian draws with standard deviation equal to the empirical standard deviation of the observed residuals. Predictive performance is evaluated by five-fold spatial cross-validation, leaving out complete monitoring locations.
+
+### Data preparation
+
+```{r}
+#| label: prepare-pm10-data
+#| code-fold: true
+#| code-summary: "Show PM10 data-preparation code"
+#| results: hide
+#| message: false
+#| warning: false
+
+library(progress)
+library(ggplot2)
+library(sf)
+library(dplyr)
+
+# ==============================================================================
+# Load and prepare the PM10 residual data
+# ==============================================================================
+
+lssrm_residuals <- read.csv(
+  "LRSSM_Residuals/residuals_PM10_rankR100.csv"
+)
+
+coords <- read.csv(
+  "LRSSM_Residuals/points_train.csv"
+)
+
+timestamps <- read.csv(
+  "LRSSM_Residuals/timestamp.csv"
+)
+
+timestamps <- as.Date(timestamps[, 1])
+
+# The residual matrix initially has locations in rows and time in columns.
+# Transpose it to the convention T x n.
+Z <- t(
+  as.matrix(lssrm_residuals)
+)
+
+coords <- as.matrix(coords)
+
+# Restrict the analysis to the first 1,250 daily observations.
+Z <- Z[1:1250, ]
+timestamps <- timestamps[1:1250]
+
+T <- nrow(Z)
+n <- ncol(Z)
+
+# Proportion of missing residuals at each monitoring station.
+na_prop <- colMeans(
+  is.na(Z)
+)
+
+# Retain stations with no more than 20% missing residuals.
+keep <- na_prop <= 0.20
+
+n_removed <- sum(!keep)
+n_retained <- sum(keep)
+
+Z <- Z[
+  ,
+  keep,
+  drop = FALSE
+]
+
+coords <- coords[
+  keep,
+  ,
+  drop = FALSE
+]
+
+# Update dimensions after removing stations.
+T <- nrow(Z)
+n <- ncol(Z)
+
+# Impute the remaining missing values using the original procedure.
+Z[is.na(Z)] <- rnorm(
+  sum(is.na(Z)),
+  mean = 0,
+  sd = sd(
+    Z,
+    na.rm = TRUE
+  )
+)
+
+stopifnot(
+  nrow(coords) == n
+)
+
+# Model settings.
+b <- 0.8
+p <- 1
+
+theta_init <- c(
+  0.3,
+  0.2,
+  0.3
+)
+
+lb <- c(
+  1e-10,
+  0,
+  0
+)
+
+ub <- c(
+  Inf,
+  0.999,
+  0.999
+)
+```
+
+```{r}
+#| label: tbl-pm10-data-summary
+#| tbl-cap: "Summary of the PM10 residual data used in the volatility analysis."
+#| echo: true
+#| message: false
+#| warning: false
+
+pm10_data_summary <- data.frame(
+  quantity = c(
+    "Daily observations",
+    "Original monitoring stations",
+    "Removed monitoring stations",
+    "Retained monitoring stations",
+    "Maximum permitted missingness"
+  ),
+  value = c(
+    T,
+    length(keep),
+    n_removed,
+    n_retained,
+    "20%"
+  )
+)
+
+knitr::kable(
+  pm10_data_summary,
+  align = c("l", "r")
+)
+```
+
+### Five-fold spatial cross-validation
+
+The complete cross-validation is computationally intensive. The code is included for reproducibility but is not executed when the Quarto document is rendered. Instead, the subsequent chunk loads the pre-computed predictions.
+
+
+```{r}
+#| label: compute-pm10-spatial-cross-validation
+#| eval: false
+#| code-fold: true
+#| code-summary: "Show PM10 spatial cross-validation computation"
+
+source("stgarch_spatial_estimation_parallelCV.R")
+
+# Z contains the mean-adjusted PM10 residuals.
+stopifnot(all(is.finite(Z)))
+
+site_second_moments <- colMeans(Z^2)
+
+if (any(!is.finite(site_second_moments)) ||
+    any(site_second_moments <= 0)) {
+  stop("Check for degenerate or invalid residual series.")
+}
+
+v_ref <- median(site_second_moments)
+
+lb <- c(
+  omega = 1e-8 * v_ref,
+  alpha = 0,
+  beta  = 0
+)
+
+ub <- c(
+  omega = 10 * max(site_second_moments),
+  alpha = 1,
+  beta  = 1
+)
+
+# Initial persistence = 0.95 and initial unconditional variance = v_ref.
+theta_init <- c(
+  omega = 0.05 * v_ref,
+  alpha = 0.05,
+  beta  = 0.90
+)
+
+
+# Use identical folds for both prediction methods.
+set.seed(5515L)
+
+folds_pm10 <- sample(
+  rep(
+    seq_len(5L),
+    length.out = ncol(Z)
+  )
+)
+
+common_arguments <- list(
+  Z = Z,
+  coords = coords,
+  theta_init = theta_init,
+  lower = lb,
+  upper = ub,
+
+  # Compact, smooth spatial kernel.
+  weight_function = stgarch_weights,
+  bandwidth_function = stgarch_bandwidth,
+
+  # Enforce alpha + beta <= 1 - stationarity_margin.
+  stationarity_margin = 1e-4,
+
+  # Applied to the squared-process prediction for xi-BLP only.
+  epsilon = 1e-8,
+
+  folds = folds_pm10,
+  parallel = TRUE,
+  n_workers = 5L,
+  progress = TRUE
+)
+
+fit_xi <- do.call(
+  fit_stgarch_spatial_cv,
+  c(
+    common_arguments,
+    list(predictor = "xi_blp")
+  )
+)
+
+fit_eta <- do.call(
+  fit_stgarch_spatial_cv,
+  c(
+    common_arguments,
+    list(predictor = "eta_gaussian")
+  )
+)
+
+comparison_pm10 <- data.frame(
+  predictor = c("xi_blp", "eta_gaussian"),
+  RMSE = c(fit_xi$RMSE_vol, fit_eta$RMSE_vol),
+  MAE = c(fit_xi$MAE_vol, fit_eta$MAE_vol),
+  coverage = c(
+    fit_xi$evaluation_coverage,
+    fit_eta$evaluation_coverage
+  )
+)
+
+print(comparison_pm10)
+
+results_directory <- "LRSSM_Residuals"
+
+dir.create(
+  results_directory,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+pm10_results_file <- file.path(
+  results_directory,
+  "PM10_STGARCH_spatial_CV.rds"
+)
+
+saveRDS(
+  list(
+    fit_xi = fit_xi,
+    fit_eta = fit_eta,
+    comparison = comparison_pm10,
+    folds = folds_pm10
+  ),
+  file = pm10_results_file
+)
+```
+
+
+
+### Load the pre-computed cross-validation results
+```{r}
+#| label: load-pm10-spatial-cross-validation
+#| message: false
+#| warning: false
+
+cv_results_file <- file.path(
+  "LRSSM_Residuals",
+  "PM10_STGARCH_spatial_CV.rds"
+)
+
+if (!file.exists(cv_results_file)) {
+  stop(
+    paste0(
+      "The pre-computed PM10 cross-validation results were not found at: ",
+      cv_results_file,
+      ". Run the computation chunk manually before rendering."
+    )
+  )
+}
+
+cv_results <- readRDS(
+  cv_results_file
+)
+
+# Extract both prediction methods.
+fit_xi <- cv_results$fit_xi
+fit_eta <- cv_results$fit_eta
+
+folds_pm10 <- cv_results$folds
+
+# Method-specific prediction objects.
+Z_pred_S2_xi <- fit_xi$Z_pred_S2
+sigma2_pred_S2_xi <- fit_xi$sigma2_pred_S2
+estimated_params_xi <- fit_xi$estimated_params
+
+Z_pred_S2_eta <- fit_eta$Z_pred_S2
+sigma2_pred_S2_eta <- fit_eta$sigma2_pred_S2
+estimated_params_eta <- fit_eta$estimated_params
+
+# Use the xi-BLP results as the primary objects in subsequent figures.
+# Replace `fit_xi` with `fit_eta` here if the Gaussian predictor should
+# be used as the primary method.
+primary_fit <- fit_xi
+
+Z_pred_S2 <- primary_fit$Z_pred_S2
+sigma2_pred_S2 <- primary_fit$sigma2_pred_S2
+estimated_params_all <- primary_fit$estimated_params
+folds <- primary_fit$folds
+RMSE_vol <- primary_fit$RMSE_vol
+MAE_vol <- primary_fit$MAE_vol
+
+
+comparison_pm10 <- data.frame(
+  predictor = c(
+    "Squared-innovation BLP",
+    "Gaussian conditional moment"
+  ),
+  method = c(
+    "xi_blp",
+    "eta_gaussian"
+  ),
+  RMSE = c(
+    fit_xi$RMSE_vol,
+    fit_eta$RMSE_vol
+  ),
+  MAE = c(
+    fit_xi$MAE_vol,
+    fit_eta$MAE_vol
+  ),
+  coverage = c(
+    fit_xi$evaluation_coverage,
+    fit_eta$evaluation_coverage
+  )
+)
+
+comparison_pm10
+
+
+
+```
+
+### Predicted residual volatility
+
+The spatial panel displays the median cross-validated volatility prediction at
+each monitoring station. Point size represents temporal variability in the
+prediction. The temporal panel shows the cross-sectional median and
+interquartile range together with two selected monitoring stations.
+
+```{r}
+#| label: fig-pm10-predicted-volatility
+#| fig-width: 12
+#| fig-height: 5.5
+#| fig-cap: "Predicted residual volatility in the PM10 application. The left panel shows the spatial distribution of median predicted volatility. The right panel shows the cross-sectional median, interquartile range and two selected station-specific trajectories."
+#| echo: true
+#| message: false
+#| warning: false
+
+# ==============================================================================
+# Station-specific volatility summaries
+# ==============================================================================
+
+Z_pred <- sqrt(
+  pmax(
+    Z_pred_S2[-1, ],
+    1e-8
+  )
+)
+
+pred_vola_median <- apply(
+  Z_pred,
+  2,
+  median
+)
+
+pred_vola_sd <- apply(
+  Z_pred,
+  2,
+  sd
+)
+
+# Colour classes based on quantiles of median predicted volatility.
+col_fun <- colorRampPalette(
+  c(
+    "steelblue",
+    "grey",
+    "darkred"
+  )
+)
+
+n_bins <- 7
+cols <- col_fun(n_bins)
+
+vola_breaks <- quantile(
+  pred_vola_median,
+  probs = seq(
+    0,
+    1,
+    length.out = n_bins + 1
+  ),
+  na.rm = TRUE
+)
+
+vola_bins <- cut(
+  pred_vola_median,
+  breaks = vola_breaks,
+  include.lowest = TRUE,
+  labels = FALSE
+)
+
+# Point size represents the temporal standard deviation of the prediction.
+scaled_cex <- sqrt(
+  scales::rescale(
+    pred_vola_sd,
+    to = c(
+      0.5,
+      2
+    )
+  )
+)
+
+xlab_name <- colnames(coords)[1]
+ylab_name <- colnames(coords)[2]
+
+legend_labels <- levels(
+  cut(
+    pred_vola_median,
+    breaks = vola_breaks,
+    include.lowest = TRUE
+  )
+)
+
+
+# ==============================================================================
+# Italy map
+# ==============================================================================
+
+italy <- sf::st_read(
+  "LRSSM_Residuals/it_shp/it.shp",
+  quiet = TRUE
+)
+
+italy <- sf::st_make_valid(
+  italy
+)
+
+italy_plot <- sf::st_transform(
+  italy,
+  4326
+)
+
+# Stations highlighted in both panels.
+idx_low <- 1
+idx_high <- 30
+
+stopifnot(
+  idx_low <= n,
+  idx_high <= n
+)
+
+col_low <- cols[
+  vola_bins[idx_low]
+]
+
+col_high <- cols[
+  vola_bins[idx_high]
+]
+
+
+# ==============================================================================
+# Temporal summaries
+# ==============================================================================
+
+time_vec <- timestamps[2:T]
+
+median_vol <- apply(
+  Z_pred,
+  1,
+  median,
+  na.rm = TRUE
+)
+
+lower_vol <- apply(
+  Z_pred,
+  1,
+  quantile,
+  probs = 0.25,
+  na.rm = TRUE
+)
+
+upper_vol <- apply(
+  Z_pred,
+  1,
+  quantile,
+  probs = 0.75,
+  na.rm = TRUE
+)
+
+
+# ==============================================================================
+# Joint figure
+# ==============================================================================
+
+old_par <- par(
+  no.readonly = TRUE
+)
+
+layout(
+  matrix(
+    c(1, 2),
+    nrow = 1
+  ),
+  widths = c(
+    1,
+    1.25
+  )
+)
+
+
+# ------------------------------------------------------------------------------
+# Panel (a): spatial distribution
+# ------------------------------------------------------------------------------
+
+par(
+  mar = c(
+    4.2,
+    4.2,
+    3.2,
+    1.2
+  )
+)
+
+# pdf("pred_vola_space_lrssm.pdf", height = 5, width = 5)
+
+plot(
+  sf::st_geometry(italy_plot),
+  border = "grey40",
+  col = NA,
+  lwd = 0.8,
+  xlab = xlab_name,
+  ylab = ylab_name,
+  main = "Median predicted volatility",
+  asp = 1,
+  axes = TRUE
+)
+
+grid(
+  col = "grey90",
+  lty = "solid"
+)
+
+box()
+
+plot(
+  sf::st_geometry(italy_plot),
+  border = "grey40",
+  col = NA,
+  lwd = 0.8,
+  add = TRUE
+)
+
+points(
+  coords,
+  col = "grey30",
+  bg = cols[vola_bins],
+  pch = 21,
+  cex = scaled_cex,
+  lwd = 0.5
+)
+
+# Highlight the two selected monitoring stations.
+points(
+  coords[
+    idx_low,
+    ,
+    drop = FALSE
+  ],
+  col = "black",
+  bg = col_low,
+  pch = 24,
+  cex = 1.7,
+  lwd = 1.2
+)
+
+points(
+  coords[
+    idx_high,
+    ,
+    drop = FALSE
+  ],
+  col = "black",
+  bg = col_high,
+  pch = 22,
+  cex = 1.7,
+  lwd = 1.2
+)
+
+legend(
+  "topright",
+  legend = legend_labels,
+  pt.bg = cols,
+  col = "grey30",
+  pch = 21,
+  pt.cex = 1.3,
+  title = "Median volatility",
+  bty = "n",
+  y.intersp = 1.1,
+  x.intersp = 0.8,
+  cex = 0.75
+)
+
+legend(
+  "bottomleft",
+  legend = c(
+    "Selected station 1",
+    "Selected station 2"
+  ),
+  pt.bg = c(
+    col_low,
+    col_high
+  ),
+  col = "black",
+  pch = c(
+    24,
+    22
+  ),
+  pt.cex = 1.4,
+  bty = "n",
+  y.intersp = 1.1,
+  cex = 0.8
+)
+
+# dev.off()
+
+
+# ------------------------------------------------------------------------------
+# Panel (b): temporal evolution
+# ------------------------------------------------------------------------------
+
+par(
+  mar = c(
+    4.2,
+    4.2,
+    3.2,
+    1.2
+  )
+)
+
+# pdf("Pred_vola_time_lrssm.pdf", width = 7, height = 5)
+
+plot(
+  time_vec,
+  median_vol,
+  type = "n",
+  ylim = range(
+    c(
+      lower_vol,
+      upper_vol,
+      Z_pred[, idx_low],
+      Z_pred[, idx_high]
+    ),
+    na.rm = TRUE
+  ),
+  xlab = "Time",
+  ylab = "Predicted volatility",
+  main = "Predicted volatility over time"
+)
+
+polygon(
+  c(
+    time_vec,
+    rev(time_vec)
+  ),
+  c(
+    lower_vol,
+    rev(upper_vol)
+  ),
+  col = "grey85",
+  border = NA
+)
+
+lines(
+  time_vec,
+  Z_pred[, idx_low],
+  col = col_low,
+  lwd = 1.4
+)
+
+lines(
+  time_vec,
+  Z_pred[, idx_high],
+  col = col_high,
+  lwd = 1.4
+)
+
+lines(
+  time_vec,
+  median_vol,
+  col = "black",
+  lwd = 2
+)
+
+legend(
+  "topright",
+  legend = c(
+    "Median",
+    "Interquartile range",
+    "Low-volatility station",
+    "High-volatility station"
+  ),
+  col = c(
+    "black",
+    "grey85",
+    col_low,
+    col_high
+  ),
+  lwd = c(
+    2,
+    8,
+    1.4,
+    1.4
+  ),
+  lty = 1,
+  bty = "n",
+  cex = 0.8
+)
+
+# dev.off()
+
+layout(1)
+par(old_par)
+```
+
+### Full estimation and spatial parameter surfaces
+
+The model is next re-estimated using all retained monitoring stations.
+The local GARCH parameters are evaluated at the centroids of a hexagonal
+tessellation of Italy. The full computation is displayed but not executed
+during rendering.
+
+```{r}
+#| label: compute-pm10-full-model
+#| eval: false
+#| code-fold: true
+#| code-summary: "Show full PM10 estimation and surface code"
+#| message: true
+#| warning: true
+
+source("stgarch_spatial_estimation_parallelCV.R")
+
+# Use the same parameter bounds and kernel specification as in the CV analysis.
+# lb and ub must be finite; theta_init must be strictly inside the constraints.
+local_fit_arguments <- list(
+  Z = Z,
+  coords = coords,
+  theta_init = theta_init,
+  lower = lb,
+  upper = ub,
+  weight_function = stgarch_weights,
+  bandwidth_function = stgarch_bandwidth,
+  stationarity_margin = 1e-4,
+  parallel = TRUE,
+  n_workers = 5L,
+  progress = TRUE
+)
+
+# ==============================================================================
+# Full estimation at the observed monitoring stations
+# ==============================================================================
+
+observed_parameter_fit <- do.call(
+  fit_stgarch_local_parameters,
+  c(local_fit_arguments, list(target_coords = coords))
+)
+
+output_optimum_full <- observed_parameter_fit$estimated_params
+b <- observed_parameter_fit$bandwidth
+
+# Failed optimizations stop inside the fitting function; there is no longer
+# a separate observed_parameter_fit$convergence object.
+
+# ==============================================================================
+# Recover the fitted variance and innovation processes
+# ==============================================================================
+
+inv_return <- stgarch_invert(
+  Z = Z,
+  parameters = output_optimum_full
+)
+
+sigma2_fit <- inv_return$sigma2
+eta_S1_hat <- inv_return$eta
+xi_S1_hat <- inv_return$xi
+zeta_S1_hat <- sigma2_fit * xi_S1_hat
+
+# Row 1 initializes the filter and is excluded from covariance estimation.
+eta_train <- eta_S1_hat[-1L, , drop = FALSE]
+D_train <- as.matrix(stats::dist(coords))
+
+# ==============================================================================
+# Fit exactly the same spatial covariance model as in cross-validation
+# ==============================================================================
+
+# This helper is defined in the sourced estimation file and used by the CV
+# function. It fits the covariance and normalizes it to C_eta(0) = 1.
+par_eta_hat <- .stgarch_covariance(
+  eta = eta_train,
+  D = D_train
+)
+
+# Keep these names for downstream tables. sigma2 and tau2 now denote the
+# normalized covariance components, so sigma2 + tau2 = 1.
+theta <- par_eta_hat$range
+sigma2 <- par_eta_hat$spatial_variance
+tau2 <- par_eta_hat$nugget_variance
+
+# par_eta_hat is now the covariance helper's result, not an optim object.
+# Its raw_total_variance field records the scale before normalization.
+# The old numerical Hessian is not calculated or saved.
+
+# ==============================================================================
+# Construct a hexagonal parameter-estimation grid over Italy
+# ==============================================================================
+
+italy <- sf::st_read("LRSSM_Residuals/it_shp/it.shp", quiet = TRUE)
+italy <- sf::st_make_valid(italy)
+italy_proj <- sf::st_transform(italy, 3035)
+
+cell_size <- 25000
+
+hex_grid <- sf::st_make_grid(
+  italy_proj,
+  cellsize = cell_size,
+  square = FALSE
+)
+
+hex_grid <- sf::st_sf(
+  grid_id = seq_along(hex_grid),
+  geometry = hex_grid
+)
+
+hex_italy <- sf::st_intersection(
+  hex_grid,
+  sf::st_union(italy_proj)
+)
+
+# Construct centroids in the projected CRS, then transform to the same
+# longitude/latitude coordinates used by the monitoring-station model.
+# This assumes coords[, 1:2] are longitude/latitude in EPSG:4326.
+centroids_hex <- sf::st_sf(
+  grid_id = hex_italy$grid_id,
+  geometry = sf::st_centroid(sf::st_geometry(hex_italy))
+)
+centroids_hex <- sf::st_transform(centroids_hex, 4326)
+S0 <- sf::st_coordinates(centroids_hex)[, 1:2, drop = FALSE]
+n0 <- nrow(S0)
+
+# ==============================================================================
+# Estimate parameter surfaces where the spatial kernel has training support
+# ==============================================================================
+
+grid_supported <- vapply(seq_len(n0), function(i) {
+  w <- local_fit_arguments$weight_function(
+    coords[, 1] - S0[i, 1],
+    coords[, 2] - S0[i, 2],
+    b
+  )
+  any(w > 0)
+}, logical(1))
+
+if (!any(grid_supported)) {
+  stop("No grid centroids have kernel support; check coordinates and bandwidth.")
+}
+
+message(
+  "Estimating ", sum(grid_supported), " of ", n0, " grid cells; ",
+  sum(!grid_supported), " cells have no kernel support and remain NA."
+)
+
+grid_parameter_fit <- do.call(
+  fit_stgarch_local_parameters,
+  c(
+    local_fit_arguments,
+    list(
+      target_coords = S0[grid_supported, , drop = FALSE],
+      bandwidth = b
+    )
+  )
+)
+
+param_names <- c("omega", "alpha", "beta")
+estimated_params_S0 <- matrix(
+  NA_real_,
+  nrow = n0,
+  ncol = length(param_names),
+  dimnames = list(NULL, param_names)
+)
+estimated_params_S0[grid_supported, ] <- grid_parameter_fit$estimated_params
+
+# Preserve every grid row and its geometry. Unsupported cells remain NA;
+# this support mask does not represent a confidence or precision criterion.
+grid_plot <- hex_italy
+grid_plot$kernel_supported <- grid_supported
+for (param in param_names) {
+  grid_plot[[param]] <- estimated_params_S0[, param]
+  grid_plot[[paste0(param, "_masked")]] <- estimated_params_S0[, param]
+}
+
+# coords_sf contains MONITORING STATIONS, not grid centroids.
+coords_sf <- sf::st_as_sf(
+  data.frame(
+    station_id = seq_len(nrow(coords)),
+    lon = coords[, 1],
+    lat = coords[, 2]
+  ),
+  coords = c("lon", "lat"),
+  crs = 4326,
+  remove = FALSE
+)
+coords_sf <- sf::st_transform(coords_sf, sf::st_crs(grid_plot))
+
+# ==============================================================================
+# Save the pre-computed full-model results
+# ==============================================================================
+
+results_directory <- "LRSSM_Residuals"
+dir.create(results_directory, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  list(
+    output_optimum_full = output_optimum_full,
+    sigma2_fit = sigma2_fit,
+    eta_S1_hat = eta_S1_hat,
+    xi_S1_hat = xi_S1_hat,
+    zeta_S1_hat = zeta_S1_hat,
+    D_train = D_train,
+    par_eta_hat = par_eta_hat,
+    theta = theta,
+    sigma2 = sigma2,
+    tau2 = tau2,
+    estimated_params_S0 = estimated_params_S0,
+    grid_plot = grid_plot,
+    coords_sf = coords_sf,
+    centroids_hex = centroids_hex,
+    S0 = S0,
+    grid_supported = grid_supported,
+    param_names = param_names,
+    bandwidth = b,
+    cell_size = cell_size,
+    fitting_settings = list(
+      theta_init = theta_init,
+      lower = lb,
+      upper = ub,
+      stationarity_margin = local_fit_arguments$stationarity_margin,
+      kernel = "separable biweight"
+    )
+  ),
+  file = file.path(results_directory, "LRSSM_STGARCH_full_results.rds")
+)
+```
+
+
+### Spatially varying GARCH parameters
+
+
+```{r}
+#| label: fig-pm10-parameter-surfaces
+#| layout-ncol: 3
+#| fig-width: 5
+#| fig-height: 6
+#| fig-cap: "Estimated spatially varying GARCH parameter surfaces for the PM10 residual volatility model. Cells without spatial kernel support are left unfilled."
+#| echo: true
+#| message: false
+#| warning: false
+
+library(ggplot2)
+
+# Load the results produced by the updated full-estimation block.
+full_results_file <- file.path(
+  "LRSSM_Residuals",
+  "LRSSM_STGARCH_full_results.rds"
+)
+
+
+full_results <- readRDS(full_results_file)
+
+grid_plot <- full_results$grid_plot
+coords_sf <- full_results$coords_sf
+
+param_names <- c("omega", "alpha", "beta")
+
+if (
+  !is.logical(grid_plot$kernel_supported) ||
+  anyNA(grid_plot$kernel_supported)
+) {
+  stop("The saved kernel-support mask is invalid.")
+}
+
+if (
+  is.na(sf::st_crs(grid_plot)) ||
+  is.na(sf::st_crs(coords_sf))
+) {
+  stop("Both the grid and monitoring stations need a valid CRS.")
+}
+
+# Monitoring stations and grid must use the same plotting CRS.
+coords_sf_plot <- sf::st_transform(
+  coords_sf,
+  sf::st_crs(grid_plot)
+)
+
+col_vals <- grDevices::colorRampPalette(
+  c("steelblue", "grey", "darkred")
+)(100)
+
+for (param in param_names) {
+
+  plot_data <- grid_plot
+
+  plot_data$fill_value <- ifelse(
+    plot_data$kernel_supported,
+    plot_data[[param]],
+    NA_real_
+  )
+
+  if (!any(is.finite(plot_data$fill_value))) {
+    stop("No finite supported estimates are available for ", param, ".")
+  }
+
+  gg <- ggplot() +
+    geom_sf(
+      data = plot_data,
+      aes(fill = fill_value),
+      colour = NA
+    ) +
+    geom_sf(
+      data = plot_data,
+      fill = NA,
+      colour = "grey70",
+      linewidth = 0.05
+    ) +
+    geom_sf(
+      data = coords_sf_plot,
+      colour = "black",
+      fill = "white",
+      shape = 21,
+      size = 1.5,
+      stroke = 0.3
+    ) +
+    scale_fill_gradientn(
+      colours = col_vals,
+      na.value = "transparent",
+      name = param
+    ) +
+    coord_sf() +
+    labs(
+      title = paste("Estimated", param),
+      x = NULL,
+      y = NULL
+    ) +
+    theme_minimal()
+  
+  # pdf_file <- paste0("surface_", param, "_lssrm.pdf")
+  # ggsave(pdf_file, plot = gg, width = 5, height = 6)
+
+  print(gg)
+}
+```
+
+

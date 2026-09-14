@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software or the heterogeneous spatiotemporal GARCH
+  methodology in your research, please cite the arXiv paper below.
+type: software
+title: "Heterogeneous Spatiotemporal GARCH: Reproducibility Code"
+authors:
+  - family-names: Aouri
+    given-names: Atika
+  - family-names: Otto
+    given-names: Philipp
+abstract: >-
+  Reproducible R code for heterogeneous spatiotemporal GARCH models,
+  including spatial estimation, volatility prediction, simulations,
+  and applications to air pollution and financial data.
+keywords:
+  - spatiotemporal GARCH
+  - volatility prediction
+  - spatial statistics
+  - reproducible research
+  - R
+preferred-citation:
+  type: article
+  title: >-
+    A Heterogeneous Spatiotemporal GARCH Model: A Predictive Framework
+    for Volatility in Financial Networks
+  authors:
+    - family-names: Aouri
+      given-names: Atika
+    - family-names: Otto
+      given-names: Philipp
+  year: 2025
+  journal: arXiv
+  doi: "10.48550/arXiv.2508.20101"
+  url: "https://arxiv.org/abs/2508.20101"
+  notes: "Preprint, arXiv:2508.20101."
